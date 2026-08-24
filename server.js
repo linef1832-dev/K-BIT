@@ -99,7 +99,10 @@ io.on('connection', (socket) => {
         const botData = activeBots.get(socket.id);
         if (botData) {
             console.log(`🔴 ขาดการเชื่อมต่อ: ${botData.id}`);
-            botSocketIds.delete(botData.id);
+            // ✅ ลบ mapping เฉพาะถ้ายังชี้มาที่ socket นี้จริง (กัน socket เก่าลบตัวใหม่ตอน reconnect)
+            if (botSocketIds.get(botData.id) === socket.id) {
+                botSocketIds.delete(botData.id);
+            }
             activeBots.delete(socket.id);
             broadcastStatus(); // อัปเดตให้ Popup รู้ว่าบอทออฟไลน์ไปแล้ว
         }
