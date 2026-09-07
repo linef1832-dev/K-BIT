@@ -5,6 +5,7 @@ const cors = require('cors');
 
 const app = express();
 app.use(cors());
+require('./kbiz-api')(app); // 🔐 API สำหรับส่วนขยาย (key อยู่ใน Environment Variables)
 
 const server = http.createServer(app);
 const io = new Server(server, {
