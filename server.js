@@ -72,7 +72,7 @@ io.on('connection', (socket) => {
 
         const workerId = "job_" + Date.now() + "_" + Math.floor(Math.random() * 1000);
         // จำไว้ว่าใครสั่ง (socket + ห้องของเครื่อง) และสั่งอะไร
-        pendingRequests.set(workerId, { socketId: socket.id, clientId: data.clientId || null, bankName: data.bankName, accNo: data.accNo, system: targetMachine });
+        pendingRequests.set(workerId, { socketId: socket.id, clientId: data.clientId || null, bankName: data.bankName, accNo: data.accNo, system: targetMachine, ts: Date.now() });
         socket.emit('job_accepted', { workerId, bankName: data.bankName, accNo: data.accNo, system: targetMachine });
 
         const botData = activeBots.get(targetSocketId);
@@ -112,11 +112,26 @@ io.on('connection', (socket) => {
         broadcastStatus();
     });
 
+    // 3.5 popup เปิดใหม่ถามว่ายังมีงานของเครื่องนี้ค้างอยู่ไหม
+    socket.on('job_status', (data, ack) => {
+        const jobs = [];
+        for (const [workerId, job] of pendingRequests.entries()) if (data && job.clientId && job.clientId === data.clientId) jobs.push({ workerId, bankName: job.bankName, accNo: job.accNo, system: job.system, ts: job.ts });
+        if (typeof ack === 'function') ack({ pending: jobs });
+        else socket.emit('job_status_result', { pending: jobs });
+    });
+
     // 4. กรณีมีคนปิดโปรแกรม หรือเน็ตหลุด
     socket.on('disconnect', () => {
         const botData = activeBots.get(socket.id);
         if (botData) {
             console.log(`🔴 ขาดการเชื่อมต่อ: ${botData.id}`);
+            // งานที่ค้างอยู่กับบอทตัวนี้ → แจ้งคนสั่งว่าล้มเหลว แล้วลบทิ้ง
+            for (const [workerId, job] of pendingRequests.entries()) {
+                if (job.system !== botData.id) continue;
+                const payload = { status: 'error', message: `บอท ${botData.id} หลุดระหว่างทำงาน กรุณาลองใหม่`, workerId, reqBank: job.bankName, reqAcc: job.accNo, system: job.system };
+                if (job.clientId) io.to('client:' + job.clientId).emit('check_result', payload); else io.to(job.socketId).emit('check_result', payload);
+                pendingRequests.delete(workerId);
+            }
             // ✅ ลบ mapping เฉพาะถ้ายังชี้มาที่ socket นี้จริง (กัน socket เก่าลบตัวใหม่ตอน reconnect)
             if (botSocketIds.get(botData.id) === socket.id) {
                 botSocketIds.delete(botData.id);
@@ -126,6 +141,20 @@ io.on('connection', (socket) => {
         }
     });
 });
+
+// เก็บกวาดงานที่ค้างเกิน 3 นาที (บอทไม่ตอบ) → แจ้งคนสั่ง + ลบทิ้ง + ลดคิว
+setInterval(() => {
+    const now = Date.now();
+    for (const [workerId, job] of pendingRequests.entries()) {
+        if (now - (job.ts || 0) < 3 * 60 * 1000) continue;
+        const payload = { status: 'error', message: `บอท ${job.system} ไม่ตอบกลับ (เกิน 3 นาที) กรุณาลองใหม่`, workerId, reqBank: job.bankName, reqAcc: job.accNo, system: job.system };
+        if (job.clientId) io.to('client:' + job.clientId).emit('check_result', payload); else io.to(job.socketId).emit('check_result', payload);
+        pendingRequests.delete(workerId);
+        const sid = botSocketIds.get(job.system); const bd = sid && activeBots.get(sid);
+        if (bd && bd.count > 0) bd.count -= 1;
+    }
+    broadcastStatus();
+}, 20000);
 
 // อัปเดตสถานะให้ Popup ทุกๆ 3 วินาที (เผื่อมีคนเพิ่งกดเปิด Popup ขึ้นมาใหม่)
 setInterval(broadcastStatus, 3000);
