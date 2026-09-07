@@ -39,6 +39,12 @@ function broadcastStatus() {
 io.on('connection', (socket) => {
     console.log(`⚡ มีการเชื่อมต่อ: ${socket.id}`);
 
+    // 0. Popup / background ของส่วนขยายเครื่องเดียวกัน join ห้องเดียวกัน
+    //    ผลลัพธ์จะถูกส่งเข้าห้อง → ถึง background แม้ popup ปิดไปแล้ว (ใช้แจ้งเตือน)
+    socket.on('join', (data) => {
+        if (data && data.clientId) socket.join('client:' + data.clientId);
+    });
+
     // 1. ฝั่งบอทมารายงานตัวว่าออนไลน์
     socket.on('register', (data) => {
         if (data.role === 'host' && data.hostId) {
@@ -60,7 +66,9 @@ io.on('connection', (socket) => {
         }
 
         const workerId = "job_" + Date.now() + "_" + Math.floor(Math.random() * 1000);
-        pendingRequests.set(workerId, socket.id); // จำไว้ว่า Popup หน้าต่างไหนเป็นคนกดสั่ง
+        // จำไว้ว่าใครสั่ง (socket + ห้องของเครื่อง) และสั่งอะไร
+        pendingRequests.set(workerId, { socketId: socket.id, clientId: data.clientId || null, bankName: data.bankName, accNo: data.accNo, system: targetMachine });
+        socket.emit('job_accepted', { workerId, bankName: data.bankName, accNo: data.accNo, system: targetMachine });
 
         const botData = activeBots.get(targetSocketId);
         botData.count += 1; // เพิ่มคิว
@@ -80,10 +88,12 @@ io.on('connection', (socket) => {
 
     // 3. ฝั่งบอททำงานเสร็จ ส่งข้อมูลชื่อกลับมา
     socket.on('send_result', (data) => {
-        const popupSocketId = pendingRequests.get(data.workerId);
-        if (popupSocketId) {
-            // ส่งชื่อบัญชีกลับไปแสดงที่หน้า Popup
-            io.to(popupSocketId).emit('check_result', data.result);
+        const job = pendingRequests.get(data.workerId);
+        if (job) {
+            // แนบ workerId + สิ่งที่สั่งไปด้วย เพื่อให้ฝั่งรับจับคู่ได้ (โหมดเช็กหลายบัญชี)
+            const payload = Object.assign({}, data.result, { workerId: data.workerId, reqBank: job.bankName, reqAcc: job.accNo, system: job.system });
+            if (job.clientId) io.to('client:' + job.clientId).emit('check_result', payload);
+            else io.to(job.socketId).emit('check_result', payload);
             pendingRequests.delete(data.workerId);
         }
 
