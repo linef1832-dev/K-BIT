@@ -47,6 +47,7 @@ io.on('connection', (socket) => {
     //    ผลลัพธ์จะถูกส่งเข้าห้อง → ถึง background แม้ popup ปิดไปแล้ว (ใช้แจ้งเตือน)
     socket.on('join', (data) => {
         if (data && data.clientId) socket.join('client:' + data.clientId);
+        broadcastStatus(); // ส่งสถานะทันที ไม่ต้องรอรอบ 3 วิ
     });
 
     // 1. ฝั่งบอทมารายงานตัวว่าออนไลน์
