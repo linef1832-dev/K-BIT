@@ -25,10 +25,14 @@ function broadcastStatus() {
     for (let [machineId, socketId] of botSocketIds.entries()) {
         const botData = activeBots.get(socketId);
         if (botData) {
+            // ลำดับคิวของบอทนี้ (ใครสั่งก่อนอยู่หน้า) เพื่อให้ popup รู้ว่างานตัวเองอยู่ลำดับที่เท่าไหร่
+            const queue = [];
+            for (const job of pendingRequests.values()) if (job.system === machineId) queue.push(job.clientId || null);
             liveStatusData[machineId] = {
                 isOnline: true,
                 count: botData.count,
-                isProcessing: botData.isProcessing
+                isProcessing: botData.isProcessing,
+                queue
             };
         }
     }
@@ -72,9 +76,11 @@ io.on('connection', (socket) => {
 
         const botData = activeBots.get(targetSocketId);
         botData.count += 1; // เพิ่มคิว
-        
-        // แจ้ง Popup ว่ากำลังเข้าคิว
-        socket.emit('queue_status', { position: botData.count });
+
+        // ตำแหน่งจริงของงานนี้ในคิวของบอท (นับงานที่มาก่อนหน้า)
+        let position = 0;
+        for (const job of pendingRequests.values()) if (job.system === targetMachine) position++;
+        socket.emit('queue_status', { position, ahead: position - 1 });
 
         // สั่งงานไปที่บอทให้เริ่มดึงข้อมูล
         io.to(targetSocketId).emit('do_check', {
