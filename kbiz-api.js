@@ -155,5 +155,57 @@ module.exports = function attachKbizApi(app) {
         res.status(502).json({ ok: false, error: lastErr });
     });
 
-    console.log('[kbiz-api] ✅ routes ready: GET /api/bots, POST /api/ocr/parse');
+    // ---------- POST /api/slip/verify : ตรวจสลิปผ่าน Thunder Solution ----------
+    // body: { payload?: string (ข้อมูลจาก QR บนสลิป), image?: base64 (dataURL หรือ base64 ล้วน) }
+    // ต้องตั้ง THUNDER_TOKEN ใน Railway Variables
+    const THUNDER_TOKEN = process.env.THUNDER_TOKEN || '';
+    app.options('/api/slip/verify', cors);
+    app.post('/api/slip/verify', cors, auth, json, async (req, res) => {
+        if (!THUNDER_TOKEN) return res.status(503).json({ ok: false, error: 'ยังไม่ได้ตั้ง THUNDER_TOKEN บนเซิร์ฟเวอร์' });
+        const { payload, image } = req.body || {};
+        if (!payload && !image) return res.status(400).json({ ok: false, error: 'ต้องส่ง payload หรือ image' });
+        const H = { Authorization: `Bearer ${THUNDER_TOKEN}` };
+        const call = async (url, init) => {
+            const controller = new AbortController(); const t = setTimeout(() => controller.abort(), 20000);
+            try {
+                const r = await fetch(url, Object.assign({ signal: controller.signal }, init));
+                let d = null; try { d = await r.json(); } catch (e) { d = { raw: await r.text().catch(() => '') }; }
+                return { status: r.status, d };
+            } catch (e) { return { status: 0, d: { message: e.name === 'AbortError' ? 'timeout' : e.message } }; }
+            finally { clearTimeout(t); }
+        };
+        let out;
+        if (payload) {
+            out = await call('https://api.thunder.in.th/v2/verify/bank', { method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, H), body: JSON.stringify({ payload }) });
+        } else {
+            // รูป: ส่งเป็น multipart (field: file) ไป v2 ก่อน ถ้าไม่รับค่อยลอง v1
+            const b64 = String(image).replace(/^data:image\/\w+;base64,/, '');
+            const buf = Buffer.from(b64, 'base64');
+            const mk = () => { const fd = new FormData(); fd.append('file', new Blob([buf], { type: 'image/png' }), 'slip.png'); return fd; };
+            out = await call('https://api.thunder.in.th/v2/verify/bank', { method: 'POST', headers: H, body: mk() });
+            if (out.status === 0 || out.status === 404 || out.status === 415 || out.status === 400) {
+                const v1 = await call('https://api.thunder.in.th/v1/verify', { method: 'POST', headers: H, body: mk() });
+                if (v1.status === 200) out = v1;
+            }
+        }
+        const d = out.d || {};
+        const okFlag = (d.success === true) || (d.status === 200) || (out.status === 200 && d.data);
+        if (!okFlag) {
+            const msg = d.message || d.error || (d.data && d.data.message) || `thunder ${out.status}`;
+            return res.status(200).json({ ok: false, error: String(msg), code: d.code || d.status || out.status, raw: d });
+        }
+        res.json({ ok: true, data: d.data || d, raw: d });
+    });
+
+    // ---------- GET /api/slip/me : เช็กโควต้า/ข้อมูลแอปของ Thunder ----------
+    app.get('/api/slip/me', cors, auth, async (req, res) => {
+        if (!THUNDER_TOKEN) return res.status(503).json({ ok: false, error: 'ยังไม่ได้ตั้ง THUNDER_TOKEN' });
+        try {
+            const r = await fetch('https://api.thunder.in.th/v1/me', { headers: { Authorization: `Bearer ${THUNDER_TOKEN}` } });
+            const d = await r.json().catch(() => ({}));
+            res.json({ ok: r.ok, data: d.data || d });
+        } catch (e) { res.status(502).json({ ok: false, error: e.message }); }
+    });
+
+    console.log('[kbiz-api] ✅ routes ready: GET /api/bots, POST /api/ocr/parse, POST /api/slip/verify' + (THUNDER_TOKEN ? '' : ' (THUNDER_TOKEN ยังไม่ตั้ง)'));
 };
