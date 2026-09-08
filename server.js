@@ -8,158 +8,149 @@ app.use(cors());
 require('./kbiz-api')(app); // 🔐 API สำหรับส่วนขยาย (key อยู่ใน Environment Variables)
 
 const server = http.createServer(app);
-const io = new Server(server, {
-    cors: { origin: "*", methods: ["GET", "POST"] }
-});
+const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
 
-// เก็บข้อมูล Bot ที่ออนไลน์
+/* ═══════════════ STATE ═══════════════
+   activeBots   : socket.id → { id, isProcessing }
+   botSocketIds : machineId → socket.id
+   jobs         : workerId  → { socketId, clientId, bankName, accNo, system, ts, inFlight, dispatchedAt }
+   หลักการ: ทุกงานเข้าคิวกลางต่อเครื่อง → ส่งให้เครื่องทีละงาน → เสร็จค่อยส่งงานถัดไป
+            เครื่อง reconnect → งานที่ค้าง "ยิงต่อ" ให้เอง ไม่ยกเลิก
+*/
 const activeBots = new Map();
-// แมปเพื่อหา socket.id ของ bot จากชื่อ MACHINE_ID
 const botSocketIds = new Map();
-// เก็บงานที่ Popup สั่งมา (ใครเป็นคนสั่ง จะได้ตอบกลับถูกคน)
-const pendingRequests = new Map();
+const jobs = new Map();
 
-// ฟังก์ชันส่งอัปเดตสถานะให้ Popup ทุกหน้าต่างที่เปิดอยู่
-function broadcastStatus() {
-    const liveStatusData = {};
-    for (let [machineId, socketId] of botSocketIds.entries()) {
-        const botData = activeBots.get(socketId);
-        if (botData) {
-            // ลำดับคิวของบอทนี้ (ใครสั่งก่อนอยู่หน้า) เพื่อให้ popup รู้ว่างานตัวเองอยู่ลำดับที่เท่าไหร่
-            const queue = [];
-            for (const job of pendingRequests.values()) if (job.system === machineId) queue.push(job.clientId || null);
-            liveStatusData[machineId] = {
-                isOnline: true,
-                count: botData.count,
-                isProcessing: botData.isProcessing,
-                queue
-            };
-        }
-    }
-    // ส่งข้อมูลให้ Popup อัปเดต Dropdown ให้เป็นสีเขียว
-    io.emit('live_queue_status', liveStatusData);
+const JOB_MAX_AGE_MS = 3 * 60 * 1000;   // งานค้างเกิน 3 นาที → แจ้งล้มเหลว
+const INFLIGHT_STALL_MS = 100 * 1000;   // ส่งไปแล้วเครื่องไม่ตอบเกิน 100 วิ → ถือว่าค้าง ส่งใหม่/ล้มเหลว
+
+function jobsOf(machineId) {
+    return [...jobs.entries()].filter(([, j]) => j.system === machineId).sort((a, b) => a[1].ts - b[1].ts);
+}
+function replyJob(workerId, job, result) {
+    const payload = Object.assign({}, result, { workerId, reqBank: job.bankName, reqAcc: job.accNo, system: job.system });
+    if (job.clientId) io.to('client:' + job.clientId).emit('check_result', payload);
+    else io.to(job.socketId).emit('check_result', payload);
+}
+function failJob(workerId, job, reason) {
+    replyJob(workerId, job, { status: 'error', message: reason });
+    jobs.delete(workerId);
+}
+function botOf(machineId) {
+    const sid = botSocketIds.get(machineId);
+    return sid ? { sid, bot: activeBots.get(sid) } : { sid: null, bot: null };
 }
 
-// ยกเลิกงานที่ค้างอยู่กับบอทตัวหนึ่ง (บอทหลุด/รีสตาร์ท) → แจ้งคนสั่ง + ลบทิ้ง
-function failJobsOf(machineId, reason) {
-    for (const [workerId, job] of pendingRequests.entries()) {
-        if (job.system !== machineId) continue;
-        const payload = { status: 'error', message: reason, workerId, reqBank: job.bankName, reqAcc: job.accNo, system: job.system };
-        if (job.clientId) io.to('client:' + job.clientId).emit('check_result', payload); else io.to(job.socketId).emit('check_result', payload);
-        pendingRequests.delete(workerId);
+/** ส่งงานถัดไปให้เครื่อง (ถ้าเครื่องว่างและมีงานรอ) */
+function dispatchNext(machineId) {
+    const { sid, bot } = botOf(machineId);
+    if (!sid || !bot) return;
+    const list = jobsOf(machineId);
+    if (list.some(([, j]) => j.inFlight)) return;            // มีงานกำลังทำอยู่ → รอ
+    const next = list.find(([, j]) => !j.inFlight);
+    if (!next) { bot.isProcessing = false; return; }
+    const [workerId, job] = next;
+    job.inFlight = true; job.dispatchedAt = Date.now(); job.attempts = (job.attempts || 0) + 1;
+    bot.isProcessing = true;
+    io.to(sid).emit('do_check', { workerId, bankName: job.bankName, accNo: job.accNo });
+    console.log(`▶ ${machineId} ← ${job.accNo} (${job.bankName}) [คิวเหลือ ${list.length - 1}]`);
+}
+
+function broadcastStatus() {
+    const liveStatusData = {};
+    for (const [machineId, socketId] of botSocketIds.entries()) {
+        const bot = activeBots.get(socketId);
+        if (!bot) continue;
+        const queue = jobsOf(machineId).map(([, j]) => j.clientId || null);
+        liveStatusData[machineId] = { isOnline: true, count: queue.length, isProcessing: bot.isProcessing, queue };
     }
+    io.emit('live_queue_status', liveStatusData);
 }
 
 io.on('connection', (socket) => {
     console.log(`⚡ มีการเชื่อมต่อ: ${socket.id}`);
 
-    // 0. Popup / background ของส่วนขยายเครื่องเดียวกัน join ห้องเดียวกัน
-    //    ผลลัพธ์จะถูกส่งเข้าห้อง → ถึง background แม้ popup ปิดไปแล้ว (ใช้แจ้งเตือน)
     socket.on('join', (data) => {
         if (data && data.clientId) socket.join('client:' + data.clientId);
-        broadcastStatus(); // ส่งสถานะทันที ไม่ต้องรอรอบ 3 วิ
+        broadcastStatus();
     });
 
-    // 1. ฝั่งบอทมารายงานตัวว่าออนไลน์
+    // 1. เครื่อง (extension) รายงานตัว — เรียกซ้ำได้ (heartbeat) ไม่ทำงานหาย
     socket.on('register', (data) => {
-        if (data.role === 'host' && data.hostId) {
-            failJobsOf(data.hostId, `บอท ${data.hostId} เพิ่งเริ่มใหม่ งานเดิมหาย กรุณากดค้นหาอีกครั้ง`);
-            activeBots.set(socket.id, { id: data.hostId, count: 0, isProcessing: false, isOnline: true });
-            botSocketIds.set(data.hostId, socket.id);
-            console.log(`🤖 บอทออนไลน์: ${data.hostId}`);
-            broadcastStatus(); // สั่งอัปเดตหน้า Popup ทันที
+        if (!(data && data.role === 'host' && data.hostId)) return;
+        const prevSid = botSocketIds.get(data.hostId);
+        const isNewSocket = prevSid !== socket.id;
+        if (!activeBots.has(socket.id)) activeBots.set(socket.id, { id: data.hostId, isProcessing: false, isOnline: true });
+        botSocketIds.set(data.hostId, socket.id);
+        if (isNewSocket) {
+            if (prevSid && prevSid !== socket.id) activeBots.delete(prevSid);
+            console.log(`🤖 บอทออนไลน์: ${data.hostId}${prevSid ? ' (reconnect — ส่งงานค้างต่อ)' : ''}`);
+            // เครื่องต่อใหม่ → งานที่ส่งไปแล้วถือว่าหลุด ให้ส่งใหม่ (ไม่ยกเลิก)
+            for (const [, j] of jobsOf(data.hostId)) j.inFlight = false;
+            activeBots.get(socket.id).isProcessing = false;
         }
+        dispatchNext(data.hostId);
+        broadcastStatus();
     });
 
-    // 2. ฝั่ง Popup กดปุ่ม "ค้นหาชื่อบัญชี"
+    // 2. รับงาน (จาก Telegram bot หรือ popup) → เข้าคิวกลาง
     socket.on('request_check', (data) => {
         const targetMachine = data.system;
-        const targetSocketId = botSocketIds.get(targetMachine);
-
-        // ถ้าบอทไม่ออนไลน์ ให้เด้งบอก Popup
-        if (!targetSocketId || !activeBots.has(targetSocketId)) {
-            return socket.emit('check_result', { status: 'error', message: `บอท ${targetMachine} ออฟไลน์อยู่` });
-        }
+        const { sid, bot } = botOf(targetMachine);
+        if (!sid || !bot) return socket.emit('check_result', { status: 'error', message: `บอท ${targetMachine} ออฟไลน์อยู่`, system: targetMachine, reqAcc: data.accNo, reqBank: data.bankName });
 
         const workerId = "job_" + Date.now() + "_" + Math.floor(Math.random() * 1000);
-        // จำไว้ว่าใครสั่ง (socket + ห้องของเครื่อง) และสั่งอะไร
-        pendingRequests.set(workerId, { socketId: socket.id, clientId: data.clientId || null, bankName: data.bankName, accNo: data.accNo, system: targetMachine, ts: Date.now() });
+        jobs.set(workerId, { socketId: socket.id, clientId: data.clientId || null, bankName: data.bankName, accNo: data.accNo, system: targetMachine, ts: Date.now(), inFlight: false });
         socket.emit('job_accepted', { workerId, bankName: data.bankName, accNo: data.accNo, system: targetMachine });
-
-        const botData = activeBots.get(targetSocketId);
-        botData.count += 1; // เพิ่มคิว
-
-        // ตำแหน่งจริงของงานนี้ในคิวของบอท (นับงานที่มาก่อนหน้า)
-        let position = 0;
-        for (const job of pendingRequests.values()) if (job.system === targetMachine) position++;
+        const position = jobsOf(targetMachine).length;
         socket.emit('queue_status', { position, ahead: position - 1 });
-
-        // สั่งงานไปที่บอทให้เริ่มดึงข้อมูล
-        io.to(targetSocketId).emit('do_check', {
-            workerId: workerId,
-            bankName: data.bankName,
-            accNo: data.accNo
-        });
-
+        dispatchNext(targetMachine);
         broadcastStatus();
     });
 
-    // 3. ฝั่งบอททำงานเสร็จ ส่งข้อมูลชื่อกลับมา
+    // 3. เครื่องส่งผลกลับ → ตอบคนสั่ง → ส่งงานถัดไป
     socket.on('send_result', (data) => {
-        const job = pendingRequests.get(data.workerId);
-        if (job) {
-            // แนบ workerId + สิ่งที่สั่งไปด้วย เพื่อให้ฝั่งรับจับคู่ได้ (โหมดเช็กหลายบัญชี)
-            const payload = Object.assign({}, data.result, { workerId: data.workerId, reqBank: job.bankName, reqAcc: job.accNo, system: job.system });
-            if (job.clientId) io.to('client:' + job.clientId).emit('check_result', payload);
-            else io.to(job.socketId).emit('check_result', payload);
-            pendingRequests.delete(data.workerId);
-        }
-
-        // ลดคิวบอทลง
-        const botData = activeBots.get(socket.id);
-        if (botData && botData.count > 0) {
-            botData.count -= 1;
-        }
+        const job = jobs.get(data.workerId);
+        const bot = activeBots.get(socket.id);
+        if (job) { replyJob(data.workerId, job, data.result || {}); jobs.delete(data.workerId); }
+        if (bot) { bot.isProcessing = false; dispatchNext(bot.id); }
         broadcastStatus();
     });
 
-    // 4. กรณีมีคนปิดโปรแกรม หรือเน็ตหลุด
+    // 4. เครื่องหลุด — ไม่ยกเลิกงาน แค่ปลด inFlight รอเครื่องกลับมาแล้วส่งต่อ (sweeper จะล้มเหลวให้ถ้าเกิน 3 นาที)
     socket.on('disconnect', () => {
-        const botData = activeBots.get(socket.id);
-        if (botData) {
-            console.log(`🔴 ขาดการเชื่อมต่อ: ${botData.id}`);
-            // ✅ ลบ mapping เฉพาะถ้ายังชี้มาที่ socket นี้จริง (กัน socket เก่าลบตัวใหม่ตอน reconnect)
-            if (botSocketIds.get(botData.id) === socket.id) {
-                botSocketIds.delete(botData.id);
-                failJobsOf(botData.id, `บอท ${botData.id} หลุดระหว่างทำงาน กรุณาลองใหม่`);
+        const bot = activeBots.get(socket.id);
+        if (bot) {
+            console.log(`🔴 ขาดการเชื่อมต่อ: ${bot.id}`);
+            if (botSocketIds.get(bot.id) === socket.id) {
+                botSocketIds.delete(bot.id);
+                for (const [, j] of jobsOf(bot.id)) j.inFlight = false;
             }
             activeBots.delete(socket.id);
-            broadcastStatus(); // อัปเดตให้ Popup รู้ว่าบอทออฟไลน์ไปแล้ว
+            broadcastStatus();
         }
     });
 });
 
-// เก็บกวาดงานที่บอทไม่ตอบเกิน 3 นาที → แจ้งคนสั่ง + ลบทิ้ง + ลดคิว (กันคิวค้างปลอม)
+// เก็บกวาด: งานเก่าเกิน 3 นาที → ล้มเหลว; งาน inFlight ที่เครื่องไม่ตอบเกิน 100 วิ → ส่งใหม่ 1 ครั้ง แล้วค่อยล้มเหลว
 setInterval(() => {
     const now = Date.now();
-    for (const [workerId, job] of pendingRequests.entries()) {
-        if (now - (job.ts || 0) < 3 * 60 * 1000) continue;
-        const payload = { status: 'error', message: `บอท ${job.system} ไม่ตอบกลับ (เกิน 3 นาที) กรุณาลองใหม่`, workerId, reqBank: job.bankName, reqAcc: job.accNo, system: job.system };
-        if (job.clientId) io.to('client:' + job.clientId).emit('check_result', payload); else io.to(job.socketId).emit('check_result', payload);
-        pendingRequests.delete(workerId);
-        const sid = botSocketIds.get(job.system); const bd = sid && activeBots.get(sid);
-        if (bd && bd.count > 0) bd.count -= 1;
+    const touched = new Set();
+    for (const [workerId, job] of jobs.entries()) {
+        if (now - job.ts > JOB_MAX_AGE_MS) { failJob(workerId, job, `บอท ${job.system} ไม่ตอบกลับ (เกิน 3 นาที) กรุณาลองใหม่`); touched.add(job.system); continue; }
+        if (job.inFlight && now - (job.dispatchedAt || 0) > INFLIGHT_STALL_MS) {
+            if ((job.attempts || 0) >= 2) { failJob(workerId, job, `บอท ${job.system} ค้างระหว่างทำงาน กรุณาลองใหม่`); }
+            else { job.inFlight = false; }
+            touched.add(job.system);
+        }
     }
-}, 20000);
+    for (const m of touched) { const { bot } = botOf(m); if (bot) bot.isProcessing = false; dispatchNext(m); }
+    if (touched.size) broadcastStatus();
+}, 15000);
 
-// อัปเดตสถานะให้ Popup ทุกๆ 3 วินาที (เผื่อมีคนเพิ่งกดเปิด Popup ขึ้นมาใหม่)
 setInterval(broadcastStatus, 3000);
 
-app.get('/', (req, res) => {
-    res.send(`✅ Server is Running! Active Bots: ${activeBots.size}`);
-});
+app.get('/', (req, res) => res.send(`✅ Server is Running! Active Bots: ${activeBots.size} | Queue: ${jobs.size}`));
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`🚀 Server started on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`🚀 Server started on port ${PORT} (queue v2)`));
