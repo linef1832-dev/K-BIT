@@ -21,7 +21,7 @@ const activeBots = new Map();
 const botSocketIds = new Map();
 const jobs = new Map();
 
-const JOB_MAX_AGE_MS = 3 * 60 * 1000;   // งานค้างเกิน 3 นาที → แจ้งล้มเหลว
+const JOB_MAX_AGE_MS = 4 * 60 * 1000;   // งานรอได้สูงสุด 4 นาที (เผื่อเครื่องหลุด/refresh/login ใหม่) → ค่อยแจ้งล้มเหลว
 const INFLIGHT_STALL_MS = 100 * 1000;   // ส่งไปแล้วเครื่องไม่ตอบเกิน 100 วิ → ถือว่าค้าง ส่งใหม่/ล้มเหลว
 
 function jobsOf(machineId) {
@@ -97,7 +97,8 @@ io.on('connection', (socket) => {
     socket.on('request_check', (data) => {
         const targetMachine = data.system;
         const { sid, bot } = botOf(targetMachine);
-        if (!sid || !bot) return socket.emit('check_result', { status: 'error', message: `บอท ${targetMachine} ออฟไลน์อยู่`, system: targetMachine, reqAcc: data.accNo, reqBank: data.bankName });
+        // เครื่องหลุดอยู่ → ไม่ตอบออฟไลน์ รับเข้าคิวไว้ พอเครื่องกลับมาจะเช็คให้เอง (รอได้สูงสุด JOB_MAX_AGE_MS)
+        if (!sid || !bot) console.log(`⏳ ${targetMachine} ออฟไลน์ชั่วคราว — เก็บงาน ${data.accNo} ไว้รอ`);
 
         const workerId = "job_" + Date.now() + "_" + Math.floor(Math.random() * 1000);
         jobs.set(workerId, { socketId: socket.id, clientId: data.clientId || null, bankName: data.bankName, accNo: data.accNo, system: targetMachine, ts: Date.now(), inFlight: false });
@@ -137,7 +138,7 @@ setInterval(() => {
     const now = Date.now();
     const touched = new Set();
     for (const [workerId, job] of jobs.entries()) {
-        if (now - job.ts > JOB_MAX_AGE_MS) { failJob(workerId, job, `บอท ${job.system} ไม่ตอบกลับ (เกิน 3 นาที) กรุณาลองใหม่`); touched.add(job.system); continue; }
+        if (now - job.ts > JOB_MAX_AGE_MS) { failJob(workerId, job, `บอท ${job.system} ไม่กลับมาภายใน 4 นาที กรุณาลองใหม่`); touched.add(job.system); continue; }
         if (job.inFlight && now - (job.dispatchedAt || 0) > INFLIGHT_STALL_MS) {
             if ((job.attempts || 0) >= 2) { failJob(workerId, job, `บอท ${job.system} ค้างระหว่างทำงาน กรุณาลองใหม่`); }
             else { job.inFlight = false; }
