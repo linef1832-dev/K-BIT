@@ -155,6 +155,30 @@ module.exports = function attachKbizApi(app) {
         res.status(502).json({ ok: false, error: lastErr });
     });
 
+    // ---------- GET /api/ocr/key : ยืม key ไปยิง OCR.space ตรงๆ (เร็วกว่าผ่านเซิร์ฟเวอร์) ----------
+    app.options('/api/ocr/key', cors);
+    app.get('/api/ocr/key', cors, auth, async (req, res) => {
+        try {
+            const keys = await loadKeys();
+            const today = todayKey();
+            const usable = keys.filter(k => k.is_active && k.api_key && ((k.last_used_date === today ? (k.used_count || 0) : 0) < DAILY_LIMIT));
+            if (!usable.length) return res.status(503).json({ ok: false, error: 'ไม่มี API key ที่พร้อมใช้' });
+            usable.sort(() => Math.random() - 0.5);
+            const k = usable[0];
+            res.json({ ok: true, key: k.api_key, id: k.id, name: k.key_name, ttl: 600 });
+        } catch (e) { res.status(502).json({ ok: false, error: e.message }); }
+    });
+
+    // ---------- POST /api/ocr/used : แจ้งว่าใช้ key ไปแล้ว 1 ครั้ง ----------
+    app.options('/api/ocr/used', cors);
+    app.post('/api/ocr/used', cors, auth, json, (req, res) => {
+        if (req.body && req.body.id !== undefined) incrementUsage(req.body.id);
+        res.json({ ok: true });
+    });
+
+    // ---------- GET /api/ping : ปลุกเซิร์ฟเวอร์ ----------
+    app.get('/api/ping', cors, (req, res) => res.json({ ok: true, t: Date.now() }));
+
     // ---------- POST /api/slip/verify : ตรวจสลิปผ่าน Thunder Solution ----------
     // body: { payload?: string (ข้อมูลจาก QR บนสลิป), image?: base64 (dataURL หรือ base64 ล้วน) }
     // ต้องตั้ง THUNDER_TOKEN ใน Railway Variables
