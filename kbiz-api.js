@@ -7,9 +7,18 @@
 //      kbizApi(app);            // app = express()
 //
 //  Environment Variables ที่ต้องตั้งใน Railway → Variables:
-//      SUPABASE_URL   = https://xxxx.supabase.co
-//      SUPABASE_KEY   = (service_role key แนะนำ  หรือ anon key ก็ได้)
-//      EXT_TOKEN      = (ไม่บังคับ) ถ้าตั้ง ส่วนขยายต้องส่ง header X-KBIZ-TOKEN ให้ตรง
+//      SUPABASE_URL          = https://xxxx.supabase.co
+//      SUPABASE_KEY          = (service_role key แนะนำ  หรือ anon key ก็ได้)
+//      GOOGLE_VISION_API_KEY = (ใหม่) API key ของ Cloud Vision — OCR หลัก แม่นไทย/เร็ว
+//      THUNDER_TOKEN         = token ตรวจสลิป Thunder Solution
+//      EXT_TOKEN             = (ไม่บังคับ) ถ้าตั้ง ส่วนขยายต้องส่ง header X-KBIZ-TOKEN ให้ตรง
+//      OCR_DAILY_LIMIT       = (ไม่บังคับ) เพดานต่อ key ของ OCR.space (ดีฟอลต์ 500)
+//
+//  ── OCR ทำงานแบบไหน ──────────────────────────────────────────────
+//  POST /api/ocr/parse จะลอง Google Cloud Vision "ก่อน" (ถ้ามี GOOGLE_VISION_API_KEY)
+//  ถ้า Google ล่ม/ตอบพลาด/ไม่พบข้อความ → สลับไป OCR.space อัตโนมัติ
+//  ผลลัพธ์ทั้งสองทางถูกจัดรูปให้ "เหมือน OCR.space" (ParsedResults + TextOverlay)
+//  ส่วนขยายจึงไม่ต้องแก้โครงสร้างการอ่านผลเลย
 // =====================================================================
 
 module.exports = function attachKbizApi(app) {
@@ -18,8 +27,15 @@ module.exports = function attachKbizApi(app) {
     const EXT_TOKEN = process.env.EXT_TOKEN || '';
     const DAILY_LIMIT = parseInt(process.env.OCR_DAILY_LIMIT || '500', 10);
 
+    // 🆕 Google Cloud Vision (OCR หลัก)
+    const GOOGLE_VISION_API_KEY = process.env.GOOGLE_VISION_API_KEY || '';
+    const GV_TIMEOUT_MS = parseInt(process.env.GOOGLE_VISION_TIMEOUT_MS || '8000', 10);
+
     if (!SUPABASE_URL || !SUPABASE_KEY) {
         console.warn('[kbiz-api] ⚠️ ยังไม่ได้ตั้ง SUPABASE_URL / SUPABASE_KEY ใน Environment Variables');
+    }
+    if (!GOOGLE_VISION_API_KEY) {
+        console.warn('[kbiz-api] ⚠️ ยังไม่ได้ตั้ง GOOGLE_VISION_API_KEY — จะใช้ OCR.space อย่างเดียวไปก่อน');
     }
 
     const sbHeaders = { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` };
@@ -91,6 +107,123 @@ module.exports = function attachKbizApi(app) {
         return /apikey|api key|invalid|unauthorized|limit|quota|exceed|403|401|E101|E102|E103/i.test(msg || '');
     }
 
+    // =====================================================================
+    //  🆕 GOOGLE CLOUD VISION — OCR หลัก
+    //  คืนผลในรูปแบบ "เหมือน OCR.space" เพื่อให้ส่วนขยายอ่านต่อได้ทันที:
+    //      { ParsedResults: [ { ParsedText, TextOverlay: { Lines:[ { LineText, Words:[ {WordText,Left,Top,Height,Width} ] } ] } } ],
+    //        IsErroredOnProcessing: false, OCRExitCode: 1, __engine: 'google' }
+    // =====================================================================
+
+    // แปลง lang ที่ส่วนขยายส่งมา → languageHints + ชนิดฟีเจอร์ของ Vision
+    function gvPlan(language) {
+        const l = String(language || '').toLowerCase();
+        if (l === 'eng' || l === 'code' || l === 'en') return { hints: ['en'], feature: 'TEXT_DETECTION' };
+        if (l === 'tha' || l === 'th') return { hints: ['th', 'en'], feature: 'DOCUMENT_TEXT_DETECTION' };
+        return { hints: ['th', 'en'], feature: 'DOCUMENT_TEXT_DETECTION' }; // auto / อื่นๆ
+    }
+
+    // vertices ของ Google → กล่องแบบ OCR.space (Left/Top/Width/Height)
+    function bboxFromVertices(vertices) {
+        const xs = vertices.map(v => v.x || 0);
+        const ys = vertices.map(v => v.y || 0);
+        const left = Math.min(...xs), top = Math.min(...ys);
+        return { Left: left, Top: top, Width: Math.max(...xs) - left, Height: Math.max(...ys) - top };
+    }
+
+    // สร้าง TextOverlay.Lines จาก fullTextAnnotation ของ Google
+    // (Google ไม่ให้ "บรรทัด" ตรงๆ — เราตัดบรรทัดจาก detectedBreak ของตัวอักษรสุดท้ายในแต่ละคำ)
+    function gvBuildOverlay(fta) {
+        const lines = [];
+        if (!fta || !Array.isArray(fta.pages)) return lines;
+        let cur = [];
+        const flush = () => {
+            if (!cur.length) return;
+            const line = {
+                LineText: cur.map(w => w.WordText).join(' ').replace(/\s+/g, ' ').trim(),
+                Words: cur.map(w => ({ WordText: w.WordText, Left: w.Left, Top: w.Top, Height: w.Height, Width: w.Width })),
+                MaxHeight: Math.max(...cur.map(w => w.Height)),
+                MinTop: Math.min(...cur.map(w => w.Top))
+            };
+            if (line.LineText) lines.push(line);
+            cur = [];
+        };
+        for (const page of fta.pages) {
+            for (const block of (page.blocks || [])) {
+                for (const para of (block.paragraphs || [])) {
+                    for (const word of (para.words || [])) {
+                        const symbols = word.symbols || [];
+                        const wordText = symbols.map(s => s.text || '').join('');
+                        const box = word.boundingBox && word.boundingBox.vertices ? bboxFromVertices(word.boundingBox.vertices) : { Left: 0, Top: 0, Width: 0, Height: 0 };
+                        if (wordText) cur.push({ WordText: wordText, ...box });
+                        // ตัดบรรทัดถ้าตัวอักษรสุดท้ายของคำนี้เป็นจุดจบบรรทัด
+                        const lastBreak = symbols.length ? (symbols[symbols.length - 1].property && symbols[symbols.length - 1].property.detectedBreak) : null;
+                        const bt = lastBreak && lastBreak.type;
+                        if (bt === 'LINE_BREAK' || bt === 'EOL_SURE_SPACE') flush();
+                    }
+                    flush(); // จบย่อหน้า = จบบรรทัดด้วย
+                }
+            }
+        }
+        flush();
+        return lines;
+    }
+
+    // ยิง Google Vision — คืน object แบบ OCR.space ถ้าสำเร็จ, throw ถ้าล้ม (เพื่อให้ fallback ทำงาน)
+    async function googleVisionOCR(base64Image, language) {
+        if (!GOOGLE_VISION_API_KEY) throw new Error('no google key');
+        const b64 = String(base64Image).replace(/^data:image\/\w+;base64,/, '');
+        const { hints, feature } = gvPlan(language);
+
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), GV_TIMEOUT_MS);
+        let r;
+        try {
+            r = await fetch(`https://vision.googleapis.com/v1/images:annotate?key=${GOOGLE_VISION_API_KEY}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    requests: [{
+                        image: { content: b64 },
+                        features: [{ type: feature }],
+                        imageContext: { languageHints: hints }
+                    }]
+                }),
+                signal: controller.signal
+            });
+        } finally { clearTimeout(timer); }
+
+        if (!r.ok) {
+            // 401/403 = key ผิด/ยังไม่เปิด API, 429 = เกินโควต้า → ให้ fallback
+            const txt = await r.text().catch(() => '');
+            throw new Error(`google ${r.status}${txt ? ': ' + txt.slice(0, 200) : ''}`);
+        }
+        const j = await r.json();
+        const resp = j && j.responses && j.responses[0];
+        if (!resp) throw new Error('google empty response');
+        if (resp.error) throw new Error('google: ' + (resp.error.message || 'error'));
+
+        const fta = resp.fullTextAnnotation;
+        const parsedText = (fta && fta.text) ||
+            (resp.textAnnotations && resp.textAnnotations[0] && resp.textAnnotations[0].description) || '';
+        const clean = parsedText.trim();
+        if (!clean) throw new Error('google: no text');   // ไม่เจอข้อความ → ลอง OCR.space ต่อ
+
+        const overlay = gvBuildOverlay(fta);
+        return {
+            ParsedResults: [{
+                ParsedText: parsedText,
+                TextOverlay: { Lines: overlay, HasOverlay: overlay.length > 0, Message: '' },
+                FileParseExitCode: 1,
+                ErrorMessage: '',
+                ErrorDetails: ''
+            }],
+            OCRExitCode: 1,
+            IsErroredOnProcessing: false,
+            ProcessingTimeInMilliseconds: '0',
+            __engine: 'google'
+        };
+    }
+
     // ---------- GET /api/bots : รายชื่อบอท ----------
     app.get('/api/bots', cors, auth, async (req, res) => {
         try {
@@ -107,13 +240,25 @@ module.exports = function attachKbizApi(app) {
     });
     app.options('/api/bots', cors);
 
-    // ---------- POST /api/ocr/parse : OCR รูป ----------
-    // body: { base64Image, language: 'eng'|'tha', engine: '1'|'2'|'3', overlay: bool }
+    // ---------- POST /api/ocr/parse : OCR รูป (Google Vision หลัก → OCR.space สำรอง) ----------
+    // body: { base64Image, language: 'eng'|'tha'|'auto', engine: '1'|'2'|'3', overlay: bool }
     app.options('/api/ocr/parse', cors);
     app.post('/api/ocr/parse', cors, auth, json, async (req, res) => {
         const { base64Image, language = 'eng', engine = '2', overlay = false } = req.body || {};
         if (!base64Image || typeof base64Image !== 'string') return res.status(400).json({ ok: false, error: 'no image' });
 
+        // ── 1) ลอง Google Cloud Vision ก่อน ──
+        if (GOOGLE_VISION_API_KEY) {
+            try {
+                const data = await googleVisionOCR(base64Image, language);
+                return res.json({ ok: true, data, keyName: 'google-vision' });
+            } catch (e) {
+                console.warn('[kbiz-api] Google Vision พลาด → สลับไป OCR.space:', e.message);
+                // ตกลงไปใช้ OCR.space ต่อด้านล่าง
+            }
+        }
+
+        // ── 2) สำรอง: OCR.space (ตรรกะเดิมทั้งหมด) ──
         let keys;
         try { keys = await loadKeys(); } catch (e) { return res.status(502).json({ ok: false, error: 'โหลด API keys ไม่สำเร็จ' }); }
 
@@ -155,7 +300,7 @@ module.exports = function attachKbizApi(app) {
         res.status(502).json({ ok: false, error: lastErr });
     });
 
-    // ---------- GET /api/ocr/key : ยืม key ไปยิง OCR.space ตรงๆ (เร็วกว่าผ่านเซิร์ฟเวอร์) ----------
+    // ---------- GET /api/ocr/key : ยืม key ไปยิง OCR.space ตรงๆ (ทางเร็วสำรอง) ----------
     app.options('/api/ocr/key', cors);
     app.get('/api/ocr/key', cors, auth, async (req, res) => {
         try {
@@ -174,6 +319,11 @@ module.exports = function attachKbizApi(app) {
     app.post('/api/ocr/used', cors, auth, json, (req, res) => {
         if (req.body && req.body.id !== undefined) incrementUsage(req.body.id);
         res.json({ ok: true });
+    });
+
+    // ---------- GET /api/ocr/health : เช็คว่า Google Vision พร้อมไหม ----------
+    app.get('/api/ocr/health', cors, (req, res) => {
+        res.json({ ok: true, google: !!GOOGLE_VISION_API_KEY, primary: GOOGLE_VISION_API_KEY ? 'google-vision' : 'ocr.space' });
     });
 
     // ---------- GET /api/ping : ปลุกเซิร์ฟเวอร์ ----------
@@ -231,5 +381,7 @@ module.exports = function attachKbizApi(app) {
         } catch (e) { res.status(502).json({ ok: false, error: e.message }); }
     });
 
-    console.log('[kbiz-api] ✅ routes ready: GET /api/bots, POST /api/ocr/parse, POST /api/slip/verify' + (THUNDER_TOKEN ? '' : ' (THUNDER_TOKEN ยังไม่ตั้ง)'));
+    console.log('[kbiz-api] ✅ routes ready: /api/bots, /api/ocr/parse (' +
+        (GOOGLE_VISION_API_KEY ? 'Google Vision → OCR.space' : 'OCR.space เท่านั้น') +
+        '), /api/slip/verify' + (THUNDER_TOKEN ? '' : ' (THUNDER_TOKEN ยังไม่ตั้ง)'));
 };
