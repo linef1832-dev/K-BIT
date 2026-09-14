@@ -31,6 +31,12 @@ module.exports = function attachKbizApi(app) {
     const GOOGLE_VISION_API_KEY = process.env.GOOGLE_VISION_API_KEY || '';
     const GV_TIMEOUT_MS = parseInt(process.env.GOOGLE_VISION_TIMEOUT_MS || '8000', 10);
     const GV_DAILY_LIMIT = parseInt(process.env.GOOGLE_DAILY_LIMIT || '0', 10); // 0 = ไม่จำกัด; เกินเพดาน → ใช้ OCR.space แทนอัตโนมัติ
+    // 🆕 Gemini Flash-Lite (OCR ทางเลือก ถูกกว่า Vision ~30 เท่า) — คีย์จาก aistudio.google.com
+    const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+    const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
+    const GEMINI_TIMEOUT_MS = parseInt(process.env.GEMINI_TIMEOUT_MS || '10000', 10);
+    // เครื่องยนต์หลัก: 'vision' | 'gemini' | 'ocrspace' — อ่านจาก Supabase settings.ocr_engine (สลับได้จากหน้าแอดมิน) ถ้าไม่มีใช้ env OCR_PRIMARY
+    const OCR_PRIMARY_ENV = (process.env.OCR_PRIMARY || 'vision').toLowerCase();
 
     if (!SUPABASE_URL || !SUPABASE_KEY) {
         console.warn('[kbiz-api] ⚠️ ยังไม่ได้ตั้ง SUPABASE_URL / SUPABASE_KEY ใน Environment Variables');
@@ -251,20 +257,71 @@ module.exports = function attachKbizApi(app) {
     }
 
     // =====================================================================
+    //  🆕 GEMINI FLASH-LITE — OCR ทางเลือก (คืนรูปแบบเดียวกับ OCR.space, ไม่มี overlay)
+    // =====================================================================
+    async function geminiOCR(base64Image, language) {
+        if (!GEMINI_API_KEY) throw new Error('no gemini key');
+        const m = String(base64Image).match(/^data:(image\/\w+);base64,(.+)$/s);
+        const mime = m ? m[1] : 'image/png';
+        const b64 = m ? m[2] : String(base64Image);
+        const l = String(language || '').toLowerCase();
+        const hint = (l === 'eng' || l === 'code' || l === 'en') ? 'ข้อความส่วนใหญ่เป็นตัวเลข/ภาษาอังกฤษ/รหัส' : 'ข้อความอาจเป็นภาษาไทยปนอังกฤษและตัวเลข';
+        const prompt = `ถอดข้อความทั้งหมดที่เห็นในรูปนี้แบบตรงตัว (OCR) ${hint}
+กฎ: รักษาบรรทัดตามรูป, ไม่แปล, ไม่อธิบาย, ไม่ใส่เครื่องหมายคำพูดหรือ markdown, ภาษาไทยเขียนติดกันตามปกติ (เว้นวรรคเฉพาะที่รูปเว้น), ตัวเลขและเครื่องหมาย - ให้ตรงตามรูปทุกตัว
+ถ้าไม่มีข้อความให้ตอบว่างเปล่า`;
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
+        let r;
+        try {
+            r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    contents: [{ parts: [{ inlineData: { mimeType: mime, data: b64 } }, { text: prompt }] }],
+                    generationConfig: { temperature: 0, maxOutputTokens: 2048, thinkingConfig: { thinkingBudget: 0 } }
+                }),
+                signal: controller.signal
+            });
+        } finally { clearTimeout(timer); }
+        if (!r.ok) { const t = await r.text().catch(() => ''); throw new Error(`gemini ${r.status}${t ? ': ' + t.slice(0, 200) : ''}`); }
+        const j = await r.json();
+        const parts = j && j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts || [];
+        let text = parts.map(p => p.text || '').join('').replace(/^```[a-z]*\n?|```$/g, '').trim();
+        return {
+            ParsedResults: [{ ParsedText: text, TextOverlay: { Lines: [], HasOverlay: false, Message: '' }, FileParseExitCode: 1, ErrorMessage: '', ErrorDetails: '' }],
+            OCRExitCode: 1, IsErroredOnProcessing: false, ProcessingTimeInMilliseconds: '0', __engine: 'gemini', __empty: !text
+        };
+    }
+
+    // อ่านค่าเครื่องยนต์หลักจาก Supabase (cache 15 วิ) — หน้าแอดมินเขียนค่านี้
+    let engineCache = { at: 0, val: null };
+    async function currentEngine() {
+        if (Date.now() - engineCache.at < 15000 && engineCache.val) return engineCache.val;
+        let val = OCR_PRIMARY_ENV;
+        try {
+            const d = await sbGet('settings?key=eq.ocr_engine&select=value');
+            if (d && d[0] && d[0].value) { const v = String(JSON.parse(d[0].value) || '').toLowerCase().replace(/"/g, ''); if (['vision', 'gemini', 'ocrspace'].includes(v)) val = v; }
+        } catch (e) {}
+        if (val === 'gemini' && !GEMINI_API_KEY) val = GOOGLE_VISION_API_KEY ? 'vision' : 'ocrspace';
+        if (val === 'vision' && !GOOGLE_VISION_API_KEY) val = GEMINI_API_KEY ? 'gemini' : 'ocrspace';
+        engineCache = { at: Date.now(), val };
+        return val;
+    }
+
+    // =====================================================================
     //  📊 สถิติ OCR รายวัน (แสดงในหน้าแอดมิน) — เก็บใน memory และเซฟลง Supabase settings.ocr_stats
     // =====================================================================
     function thaiDayKey() {
         const n = new Date(Date.now() + 7 * 3600 * 1000); // UTC+7
         return n.getUTCFullYear() + '-' + String(n.getUTCMonth() + 1).padStart(2, '0') + '-' + String(n.getUTCDate()).padStart(2, '0');
     }
-    let ocrStats = { day: thaiDayKey(), google_ok: 0, google_fail: 0, fallback_ok: 0, fallback_fail: 0, last_engine: null, last_error: null, last_ms: null, last_at: null };
+    let ocrStats = { day: thaiDayKey(), google_ok: 0, google_fail: 0, gemini_ok: 0, gemini_fail: 0, fallback_ok: 0, fallback_fail: 0, last_engine: null, last_error: null, last_ms: null, last_at: null };
     (async () => { try {
         const d = await sbGet('settings?key=eq.ocr_stats&select=value');
         if (d && d[0] && d[0].value) { const s = JSON.parse(d[0].value); if (s && s.day === thaiDayKey()) ocrStats = Object.assign(ocrStats, s); }
     } catch (e) {} })();
     let statsSaveTimer = null;
     function bumpStats(field, extra) {
-        if (ocrStats.day !== thaiDayKey()) ocrStats = { day: thaiDayKey(), google_ok: 0, google_fail: 0, fallback_ok: 0, fallback_fail: 0, last_engine: null, last_error: null, last_ms: null, last_at: null };
+        if (ocrStats.day !== thaiDayKey()) ocrStats = { day: thaiDayKey(), google_ok: 0, google_fail: 0, gemini_ok: 0, gemini_fail: 0, fallback_ok: 0, fallback_fail: 0, last_engine: null, last_error: null, last_ms: null, last_at: null };
         ocrStats[field] = (ocrStats[field] || 0) + 1;
         Object.assign(ocrStats, extra || {}, { last_at: Date.now() });
         clearTimeout(statsSaveTimer);
@@ -296,17 +353,21 @@ module.exports = function attachKbizApi(app) {
 
         // ── 1) ลอง Google Cloud Vision ก่อน ──
         const overCap = GV_DAILY_LIMIT > 0 && ocrStats.day === thaiDayKey() && (ocrStats.google_ok || 0) >= GV_DAILY_LIMIT;
-        if (overCap) console.warn(`[kbiz-api] Google ถึงเพดานวันนี้ (${GV_DAILY_LIMIT}) → ใช้ OCR.space`);
-        if (GOOGLE_VISION_API_KEY && !overCap) {
+        if (overCap) console.warn(`[kbiz-api] Google ถึงเพดานวันนี้ (${GV_DAILY_LIMIT}) → ใช้ตัวถัดไป`);
+        const primary = await currentEngine();
+        // ลำดับ: เครื่องยนต์หลัก → อีกตัวของ Google (ถ้ามีคีย์) → OCR.space
+        const order = primary === 'gemini' ? ['gemini', 'vision'] : primary === 'vision' ? ['vision', 'gemini'] : [];
+        for (const eng of order) {
+            if (eng === 'vision' && (!GOOGLE_VISION_API_KEY || overCap)) continue;
+            if (eng === 'gemini' && !GEMINI_API_KEY) continue;
             const t0 = Date.now();
             try {
-                const data = await googleVisionOCR(base64Image, language);
-                bumpStats('google_ok', { last_engine: 'google', last_ms: Date.now() - t0, last_error: null });
-                return res.json({ ok: true, data, keyName: 'google-vision' });
+                const data = eng === 'vision' ? await googleVisionOCR(base64Image, language) : await geminiOCR(base64Image, language);
+                bumpStats(eng === 'vision' ? 'google_ok' : 'gemini_ok', { last_engine: eng === 'vision' ? 'google' : 'gemini', last_ms: Date.now() - t0, last_error: null });
+                return res.json({ ok: true, data, keyName: eng === 'vision' ? 'google-vision' : 'gemini' });
             } catch (e) {
-                bumpStats('google_fail', { last_error: e.message });
-                console.warn('[kbiz-api] Google Vision พลาด → สลับไป OCR.space:', e.message);
-                // ตกลงไปใช้ OCR.space ต่อด้านล่าง
+                bumpStats(eng === 'vision' ? 'google_fail' : 'gemini_fail', { last_error: e.message });
+                console.warn(`[kbiz-api] ${eng} พลาด → ลองตัวถัดไป:`, e.message);
             }
         }
 
@@ -376,9 +437,12 @@ module.exports = function attachKbizApi(app) {
     });
 
     // ---------- GET /api/ocr/health : เช็คว่า Google Vision พร้อมไหม ----------
-    app.get('/api/ocr/health', cors, (req, res) => {
+    app.get('/api/ocr/health', cors, async (req, res) => {
         if (ocrStats.day !== thaiDayKey()) bumpStats('__touch');
-        res.json({ ok: true, google: !!GOOGLE_VISION_API_KEY, primary: GOOGLE_VISION_API_KEY ? 'google-vision' : 'ocr.space', dailyLimit: GV_DAILY_LIMIT, stats: ocrStats });
+        engineCache.at = 0; // หน้าแอดมินกดรีเฟรช → อ่านค่าล่าสุดทันที
+        const engine = await currentEngine();
+        res.json({ ok: true, google: !!GOOGLE_VISION_API_KEY, gemini: !!GEMINI_API_KEY, engine, geminiModel: GEMINI_MODEL,
+                   primary: engine === 'vision' ? 'google-vision' : engine === 'gemini' ? 'gemini' : 'ocr.space', dailyLimit: GV_DAILY_LIMIT, stats: ocrStats });
     });
 
     // ---------- GET /api/ping : ปลุกเซิร์ฟเวอร์ ----------
