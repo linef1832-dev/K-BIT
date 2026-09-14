@@ -33,7 +33,7 @@ module.exports = function attachKbizApi(app) {
     const GV_DAILY_LIMIT = parseInt(process.env.GOOGLE_DAILY_LIMIT || '0', 10); // 0 = ไม่จำกัด; เกินเพดาน → ใช้ OCR.space แทนอัตโนมัติ
     // 🆕 Gemini Flash-Lite (OCR ทางเลือก ถูกกว่า Vision ~30 เท่า) — คีย์จาก aistudio.google.com
     const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
-    const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
+    const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
     const GEMINI_TIMEOUT_MS = parseInt(process.env.GEMINI_TIMEOUT_MS || '10000', 10);
     // เครื่องยนต์หลัก: 'vision' | 'gemini' | 'ocrspace' — อ่านจาก Supabase settings.ocr_engine (สลับได้จากหน้าแอดมิน) ถ้าไม่มีใช้ env OCR_PRIMARY
     const OCR_PRIMARY_ENV = (process.env.OCR_PRIMARY || 'vision').toLowerCase();
