@@ -137,10 +137,30 @@ module.exports = function attachKbizApi(app) {
         const lines = [];
         if (!fta || !Array.isArray(fta.pages)) return lines;
         let cur = [];
+        // ต่อคำในบรรทัดโดยดู "ระยะห่างจริงในภาพ" — Google ตัดคำไทยเป็นชิ้นๆ (คม|กริช) ถ้ากล่องชิดกันคือคำเดียวกัน ห้ามเว้นวรรค
+        const joinWords = (ws) => {
+            let out = '';
+            for (let i = 0; i < ws.length; i++) {
+                const w = ws[i];
+                if (i > 0) {
+                    const p = ws[i - 1];
+                    const gap = w.Left - (p.Left + p.Width);
+                    const h = Math.max(p.Height, w.Height, 1);
+                    const visibleGap = gap > h * 0.22;                       // ช่องว่างที่ตามองเห็น
+                    const bothThai = /[\u0E00-\u0E7F]$/.test(p.WordText) && /^[\u0E00-\u0E7F]/.test(w.WordText);
+                    const saidSpace = p.brk === 'SPACE' || p.brk === 'SURE_SPACE';
+                    // ไทย: เว้นเฉพาะเมื่อมีช่องว่างจริง / อังกฤษ-ตัวเลข: เชื่อ Google แต่ถ้าชิดกันมากก็ไม่เว้น
+                    const space = bothThai ? visibleGap : (saidSpace ? gap > h * 0.08 : visibleGap);
+                    if (space) out += ' ';
+                }
+                out += w.WordText;
+            }
+            return out.replace(/[ \t]+/g, ' ').trim();
+        };
         const flush = () => {
             if (!cur.length) return;
             const line = {
-                LineText: cur.map(w => w.WordText).join(' ').replace(/\s+/g, ' ').trim(),
+                LineText: joinWords(cur),
                 Words: cur.map(w => ({ WordText: w.WordText, Left: w.Left, Top: w.Top, Height: w.Height, Width: w.Width })),
                 MaxHeight: Math.max(...cur.map(w => w.Height)),
                 MinTop: Math.min(...cur.map(w => w.Top))
@@ -155,10 +175,10 @@ module.exports = function attachKbizApi(app) {
                         const symbols = word.symbols || [];
                         const wordText = symbols.map(s => s.text || '').join('');
                         const box = word.boundingBox && word.boundingBox.vertices ? bboxFromVertices(word.boundingBox.vertices) : { Left: 0, Top: 0, Width: 0, Height: 0 };
-                        if (wordText) cur.push({ WordText: wordText, ...box });
-                        // ตัดบรรทัดถ้าตัวอักษรสุดท้ายของคำนี้เป็นจุดจบบรรทัด
                         const lastBreak = symbols.length ? (symbols[symbols.length - 1].property && symbols[symbols.length - 1].property.detectedBreak) : null;
                         const bt = lastBreak && lastBreak.type;
+                        if (wordText) cur.push({ WordText: wordText, brk: bt || '', ...box });
+                        // ตัดบรรทัดถ้าตัวอักษรสุดท้ายของคำนี้เป็นจุดจบบรรทัด
                         if (bt === 'LINE_BREAK' || bt === 'EOL_SURE_SPACE') flush();
                     }
                     flush(); // จบย่อหน้า = จบบรรทัดด้วย
@@ -214,9 +234,10 @@ module.exports = function attachKbizApi(app) {
         }
 
         const overlay = gvBuildOverlay(fta);
+        const joinedText = overlay.length ? overlay.map(l => l.LineText).join('\n') : parsedText;
         return {
             ParsedResults: [{
-                ParsedText: parsedText,
+                ParsedText: joinedText,
                 TextOverlay: { Lines: overlay, HasOverlay: overlay.length > 0, Message: '' },
                 FileParseExitCode: 1,
                 ErrorMessage: '',
