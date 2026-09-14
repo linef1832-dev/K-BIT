@@ -30,6 +30,7 @@ module.exports = function attachKbizApi(app) {
     // 🆕 Google Cloud Vision (OCR หลัก)
     const GOOGLE_VISION_API_KEY = process.env.GOOGLE_VISION_API_KEY || '';
     const GV_TIMEOUT_MS = parseInt(process.env.GOOGLE_VISION_TIMEOUT_MS || '8000', 10);
+    const GV_DAILY_LIMIT = parseInt(process.env.GOOGLE_DAILY_LIMIT || '0', 10); // 0 = ไม่จำกัด; เกินเพดาน → ใช้ OCR.space แทนอัตโนมัติ
 
     if (!SUPABASE_URL || !SUPABASE_KEY) {
         console.warn('[kbiz-api] ⚠️ ยังไม่ได้ตั้ง SUPABASE_URL / SUPABASE_KEY ใน Environment Variables');
@@ -206,7 +207,11 @@ module.exports = function attachKbizApi(app) {
         const parsedText = (fta && fta.text) ||
             (resp.textAnnotations && resp.textAnnotations[0] && resp.textAnnotations[0].description) || '';
         const clean = parsedText.trim();
-        if (!clean) throw new Error('google: no text');   // ไม่เจอข้อความ → ลอง OCR.space ต่อ
+        if (!clean) {
+            // Google อ่านแล้วไม่เจอข้อความ → ตอบว่างกลับเลย (OCR.space แทบไม่มีทางเจอถ้า Google ไม่เจอ และช้ากว่ามาก)
+            return { ParsedResults: [{ ParsedText: '', TextOverlay: { Lines: [], HasOverlay: false, Message: '' }, FileParseExitCode: 1, ErrorMessage: '', ErrorDetails: '' }],
+                     OCRExitCode: 1, IsErroredOnProcessing: false, ProcessingTimeInMilliseconds: '0', __engine: 'google', __empty: true };
+        }
 
         const overlay = gvBuildOverlay(fta);
         return {
@@ -269,7 +274,9 @@ module.exports = function attachKbizApi(app) {
         if (!base64Image || typeof base64Image !== 'string') return res.status(400).json({ ok: false, error: 'no image' });
 
         // ── 1) ลอง Google Cloud Vision ก่อน ──
-        if (GOOGLE_VISION_API_KEY) {
+        const overCap = GV_DAILY_LIMIT > 0 && ocrStats.day === thaiDayKey() && (ocrStats.google_ok || 0) >= GV_DAILY_LIMIT;
+        if (overCap) console.warn(`[kbiz-api] Google ถึงเพดานวันนี้ (${GV_DAILY_LIMIT}) → ใช้ OCR.space`);
+        if (GOOGLE_VISION_API_KEY && !overCap) {
             const t0 = Date.now();
             try {
                 const data = await googleVisionOCR(base64Image, language);
@@ -350,7 +357,7 @@ module.exports = function attachKbizApi(app) {
     // ---------- GET /api/ocr/health : เช็คว่า Google Vision พร้อมไหม ----------
     app.get('/api/ocr/health', cors, (req, res) => {
         if (ocrStats.day !== thaiDayKey()) bumpStats('__touch');
-        res.json({ ok: true, google: !!GOOGLE_VISION_API_KEY, primary: GOOGLE_VISION_API_KEY ? 'google-vision' : 'ocr.space', stats: ocrStats });
+        res.json({ ok: true, google: !!GOOGLE_VISION_API_KEY, primary: GOOGLE_VISION_API_KEY ? 'google-vision' : 'ocr.space', dailyLimit: GV_DAILY_LIMIT, stats: ocrStats });
     });
 
     // ---------- GET /api/ping : ปลุกเซิร์ฟเวอร์ ----------
