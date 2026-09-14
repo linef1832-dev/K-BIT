@@ -224,6 +224,27 @@ module.exports = function attachKbizApi(app) {
         };
     }
 
+    // =====================================================================
+    //  📊 สถิติ OCR รายวัน (แสดงในหน้าแอดมิน) — เก็บใน memory และเซฟลง Supabase settings.ocr_stats
+    // =====================================================================
+    function thaiDayKey() {
+        const n = new Date(Date.now() + 7 * 3600 * 1000); // UTC+7
+        return n.getUTCFullYear() + '-' + String(n.getUTCMonth() + 1).padStart(2, '0') + '-' + String(n.getUTCDate()).padStart(2, '0');
+    }
+    let ocrStats = { day: thaiDayKey(), google_ok: 0, google_fail: 0, fallback_ok: 0, fallback_fail: 0, last_engine: null, last_error: null, last_ms: null, last_at: null };
+    (async () => { try {
+        const d = await sbGet('settings?key=eq.ocr_stats&select=value');
+        if (d && d[0] && d[0].value) { const s = JSON.parse(d[0].value); if (s && s.day === thaiDayKey()) ocrStats = Object.assign(ocrStats, s); }
+    } catch (e) {} })();
+    let statsSaveTimer = null;
+    function bumpStats(field, extra) {
+        if (ocrStats.day !== thaiDayKey()) ocrStats = { day: thaiDayKey(), google_ok: 0, google_fail: 0, fallback_ok: 0, fallback_fail: 0, last_engine: null, last_error: null, last_ms: null, last_at: null };
+        ocrStats[field] = (ocrStats[field] || 0) + 1;
+        Object.assign(ocrStats, extra || {}, { last_at: Date.now() });
+        clearTimeout(statsSaveTimer);
+        statsSaveTimer = setTimeout(() => sbUpsertSetting('ocr_stats', ocrStats).catch(() => {}), 3000);
+    }
+
     // ---------- GET /api/bots : รายชื่อบอท ----------
     app.get('/api/bots', cors, auth, async (req, res) => {
         try {
@@ -249,10 +270,13 @@ module.exports = function attachKbizApi(app) {
 
         // ── 1) ลอง Google Cloud Vision ก่อน ──
         if (GOOGLE_VISION_API_KEY) {
+            const t0 = Date.now();
             try {
                 const data = await googleVisionOCR(base64Image, language);
+                bumpStats('google_ok', { last_engine: 'google', last_ms: Date.now() - t0, last_error: null });
                 return res.json({ ok: true, data, keyName: 'google-vision' });
             } catch (e) {
+                bumpStats('google_fail', { last_error: e.message });
                 console.warn('[kbiz-api] Google Vision พลาด → สลับไป OCR.space:', e.message);
                 // ตกลงไปใช้ OCR.space ต่อด้านล่าง
             }
@@ -292,11 +316,13 @@ module.exports = function attachKbizApi(app) {
                     return res.json({ ok: true, data: d, keyName: k.key_name }); // error อื่น (เช่น อ่านไม่เจอ) → ส่งกลับให้ client ตัดสินใจ
                 }
                 incrementUsage(k.id); // ไม่ต้อง await
+                bumpStats('fallback_ok', { last_engine: 'ocr.space' });
                 return res.json({ ok: true, data: d, keyName: k.key_name });
             } catch (e) {
                 lastErr = e.name === 'AbortError' ? 'OCR.space ตอบช้าเกินไป' : e.message;
             }
         }
+        bumpStats('fallback_fail', { last_error: lastErr });
         res.status(502).json({ ok: false, error: lastErr });
     });
 
@@ -323,7 +349,8 @@ module.exports = function attachKbizApi(app) {
 
     // ---------- GET /api/ocr/health : เช็คว่า Google Vision พร้อมไหม ----------
     app.get('/api/ocr/health', cors, (req, res) => {
-        res.json({ ok: true, google: !!GOOGLE_VISION_API_KEY, primary: GOOGLE_VISION_API_KEY ? 'google-vision' : 'ocr.space' });
+        if (ocrStats.day !== thaiDayKey()) bumpStats('__touch');
+        res.json({ ok: true, google: !!GOOGLE_VISION_API_KEY, primary: GOOGLE_VISION_API_KEY ? 'google-vision' : 'ocr.space', stats: ocrStats });
     });
 
     // ---------- GET /api/ping : ปลุกเซิร์ฟเวอร์ ----------
