@@ -35,6 +35,10 @@ module.exports = function attachKbizApi(app) {
     const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
     const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
     const GEMINI_TIMEOUT_MS = parseInt(process.env.GEMINI_TIMEOUT_MS || '10000', 10);
+    // กฎความยาวรหัส: prefix=ความยาวรวม (บอก Gemini ก่อนอ่าน + ตรวจหลังอ่าน) ตั้งเพิ่มได้ใน env CODE_RULES เช่น "T88N883OK=25,T88PP88PAY=25"
+    const CODE_RULES = String(process.env.CODE_RULES || 'T88N883OK=25').split(',').map(x => x.trim()).filter(Boolean).map(x => { const [pfx, len] = x.split('='); return { pfx: (pfx || '').trim().toUpperCase(), len: parseInt(len, 10) }; }).filter(r => r.pfx && r.len > 0);
+    const ruleFor = (t) => { const u = String(t || '').replace(/\s+/g, '').toUpperCase(); return CODE_RULES.find(r => u.startsWith(r.pfx)) || null; };
+    const ruleOk = (t) => { const r = ruleFor(t); return !r || String(t).replace(/\s+/g, '').length === r.len; };
     // เครื่องยนต์หลัก: 'vision' | 'gemini' | 'ocrspace' — อ่านจาก Supabase settings.ocr_engine (สลับได้จากหน้าแอดมิน) ถ้าไม่มีใช้ env OCR_PRIMARY
     const OCR_PRIMARY_ENV = (process.env.OCR_PRIMARY || 'vision').toLowerCase();
 
@@ -259,7 +263,7 @@ module.exports = function attachKbizApi(app) {
     // =====================================================================
     //  🆕 GEMINI FLASH-LITE — OCR ทางเลือก (คืนรูปแบบเดียวกับ OCR.space, ไม่มี overlay)
     // =====================================================================
-    async function geminiOCR(base64Image, language) {
+    async function geminiOCR(base64Image, language, extraNote) {
         if (!GEMINI_API_KEY) throw new Error('no gemini key');
         const m = String(base64Image).match(/^data:(image\/\w+);base64,(.+)$/s);
         const mime = m ? m[1] : 'image/png';
@@ -270,7 +274,9 @@ module.exports = function attachKbizApi(app) {
 กฎ: รักษาบรรทัดตามรูป, ไม่แปล, ไม่อธิบาย, ไม่ใส่เครื่องหมายคำพูดหรือ markdown, ภาษาไทยเขียนติดกันตามปกติ (เว้นวรรคเฉพาะที่รูปเว้น), ตัวเลข/รหัสให้อ่านทีละตัวอักษรตามที่เห็นจริง ห้ามเดา ห้ามเติมหรือตัดตัวเลข จำนวนตัวอักษรต้องเท่ากับในรูป
 ถ้าข้อความเป็นรหัส/หมายเลข (ตัวอักษรอังกฤษ+ตัวเลขยาวติดกัน): ให้ทำ 2 ขั้น — บรรทัดแรกเขียนว่า CHARS: แล้วตามด้วยตัวอักษรทีละตัวคั่นด้วยช่องว่าง (เช่น CHARS: T 8 8 N 8 8 3 O K 2 7 6 7) โดยไล่จากซ้ายไปขวาทีละตัว นับให้ครบไม่ข้ามไม่เบิ้ล แล้วบรรทัดถัดไปเขียนรหัสเต็มโดยรวมตัวอักษรจากบรรทัด CHARS ตรงๆ
 สำคัญ: ข้อความที่ถูกตัดขาดที่ขอบรูป (เห็นแค่ครึ่งบน/ครึ่งล่างของตัวอักษร หรือบรรทัดที่โผล่มาแค่เสี้ยวเดียวที่ขอบบนหรือขอบล่าง) ให้ข้ามไป ไม่ต้องใส่ เอาเฉพาะบรรทัดที่เห็นครบทั้งตัว
-ถ้าไม่มีข้อความให้ตอบว่างเปล่า`;
+ถ้าไม่มีข้อความให้ตอบว่างเปล่า` +
+            (CODE_RULES.length ? `\nกฎรูปแบบรหัสที่ต้องยึด: ` + CODE_RULES.map(r => `รหัสที่ขึ้นต้นด้วย ${r.pfx} มีความยาวรวม ${r.len} ตัวอักษรเสมอ (ตัวเลขหลัง ${r.pfx} = ${r.len - r.pfx.length} หลัก) ถ้านับได้ไม่เท่านี้แสดงว่าอ่านผิด ให้ดูรูปใหม่อีกครั้งจนได้ครบพอดี`).join('; ') : '') +
+            (extraNote ? `\n${extraNote}` : '');
         const call = async (body) => {
             const controller = new AbortController();
             const timer = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
@@ -311,13 +317,15 @@ module.exports = function attachKbizApi(app) {
         if (cands.length) {
             const norm = t => t.replace(/\s+/g, '').toUpperCase();
             const tally = new Map(); cands.forEach(t => { const k = norm(t); tally.set(k, (tally.get(k) || 0) + 1); });
-            const best = [...tally.entries()].sort((a, b) => b[1] - a[1] || a[0].length - b[0].length)[0][0];
+            // คำตอบที่ผ่านกฎความยาวรหัสมาก่อน → แล้วค่อยนับเสียง → แล้วค่อยสั้นกว่า
+            const best = [...tally.entries()].sort((a, b) => (ruleOk(b[0]) - ruleOk(a[0])) || (b[1] - a[1]) || (a[0].length - b[0].length))[0][0];
             text = cands.find(t => norm(t) === best) || cands[0];
             if (cands.length > 1 && tally.size > 1) console.log('[kbiz-api] gemini vote:', [...tally.entries()].map(([k, n]) => n + '×' + k.slice(0, 30)).join(' | '));
+            var agree = tally.size === 1 && cands.length > 1;
         }
         return {
             ParsedResults: [{ ParsedText: text, TextOverlay: { Lines: [], HasOverlay: false, Message: '' }, FileParseExitCode: 1, ErrorMessage: '', ErrorDetails: '' }],
-            OCRExitCode: 1, IsErroredOnProcessing: false, ProcessingTimeInMilliseconds: '0', __engine: 'gemini', __empty: !text
+            OCRExitCode: 1, IsErroredOnProcessing: false, ProcessingTimeInMilliseconds: '0', __engine: 'gemini', __empty: !text, __agree: typeof agree === 'boolean' ? agree : true
         };
     }
 
@@ -416,10 +424,29 @@ module.exports = function attachKbizApi(app) {
             if (eng === 'gemini' && !GEMINI_API_KEY) continue;
             const t0 = Date.now();
             try {
-                const data = eng === 'vision' ? await googleVisionOCR(base64Image, language) : await geminiOCR(base64Image, language);
+                let data = eng === 'vision' ? await googleVisionOCR(base64Image, language) : await geminiOCR(base64Image, language);
                 bumpStats(eng === 'vision' ? 'google_ok' : 'gemini_ok', { last_engine: eng === 'vision' ? 'google' : 'gemini', last_ms: Date.now() - t0, last_error: null });
                 spend(eng);
-                return res.json({ ok: true, data, keyName: eng === 'vision' ? 'google-vision' : 'gemini' });
+                let keyName = eng === 'vision' ? 'google-vision' : 'gemini';
+                // 📏 ผลจาก Gemini ไม่ตรงกฎความยาวรหัส → ให้ Gemini อ่านใหม่อีกรอบพร้อมบอกว่าผิดตรงไหน (ไม่ใช้ Vision)
+                if (eng === 'gemini') {
+                    const txt = (data.ParsedResults[0].ParsedText || '').trim();
+                    const bad = txt.split(/\n/).map(l => l.trim()).find(l => ruleFor(l) && !ruleOk(l));
+                    if (bad) {
+                        const r = ruleFor(bad); const got = bad.replace(/\s+/g, '').length;
+                        console.log(`[kbiz-api] gemini ความยาวไม่ตรง (${got}≠${r.len}) → อ่านใหม่:`, bad.slice(0, 40));
+                        try {
+                            const t1 = Date.now();
+                            const again = await geminiOCR(base64Image, language, `หมายเหตุ: รอบก่อนอ่านรหัสได้ "${bad}" ซึ่งยาว ${got} ตัว แต่รหัสที่ขึ้นต้น ${r.pfx} ต้องยาว ${r.len} ตัวพอดี แสดงว่ามีตัวเลข${got > r.len ? 'เกินมา ' + (got - r.len) + ' ตัว (มักเป็นเลขซ้ำที่ถูกเบิ้ล)' : 'หายไป ' + (r.len - got) + ' ตัว'} ให้ดูรูปใหม่อย่างระมัดระวังทีละตัว แล้วตอบรหัสที่ยาว ${r.len} ตัวพอดี`);
+                            const t2 = (again.ParsedResults[0].ParsedText || '').trim();
+                            const fixed = t2.split(/\n/).map(l => l.trim()).find(l => ruleFor(l));
+                            bumpStats('gemini_ok', { last_engine: 'gemini×2', last_ms: Date.now() - t1 }); spend('gemini');
+                            if (fixed && ruleOk(fixed)) { data = again; keyName = 'gemini×2'; console.log('[kbiz-api] อ่านใหม่แล้วได้:', fixed); }
+                            else console.warn('[kbiz-api] อ่านใหม่ยังไม่ตรงกฎ ใช้ผลรอบแรก');
+                        } catch (e) { console.warn('[kbiz-api] อ่านใหม่ล้ม:', e.message); }
+                    }
+                }
+                return res.json({ ok: true, data, keyName });
             } catch (e) {
                 bumpStats(eng === 'vision' ? 'google_fail' : 'gemini_fail', { last_error: e.message });
                 console.warn(`[kbiz-api] ${eng} พลาด → ลองตัวถัดไป:`, e.message);
