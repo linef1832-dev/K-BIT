@@ -282,7 +282,9 @@ module.exports = function attachKbizApi(app) {
             } finally { clearTimeout(timer); }
         };
         const contents = [{ role: 'user', parts: [{ text: prompt }, { inline_data: { mime_type: mime, data: b64 } }] }];
-        const gen = { temperature: 0, maxOutputTokens: 2048, mediaResolution: process.env.GEMINI_MEDIA_RES || 'MEDIA_RESOLUTION_HIGH' }; // ดูรูปละเอียดขึ้น ช่วยอ่านเลข/ตัวเล็ก
+        // ตอบ 3 คำตอบในคำขอเดียว (ส่งรูปครั้งเดียว) แล้วโหวต — ลด "เบิ้ลเลข" ที่เกิดแบบสุ่ม
+        const NCAND = Math.max(1, Math.min(4, parseInt(process.env.GEMINI_CANDIDATES || '3', 10)));
+        const gen = { temperature: NCAND > 1 ? 0.5 : 0, candidateCount: NCAND, maxOutputTokens: 2048, mediaResolution: process.env.GEMINI_MEDIA_RES || 'MEDIA_RESOLUTION_HIGH' };
         let r = await call({ contents, generationConfig: gen });
         if (r.status === 400) {
             const t1 = await r.text().catch(() => '');
@@ -291,17 +293,28 @@ module.exports = function attachKbizApi(app) {
         }
         if (!r.ok) { const t = await r.text().catch(() => ''); throw new Error(`gemini ${r.status}${t ? ': ' + t.replace(/\s+/g, ' ').slice(0, 400) : ''}`); }
         const j = await r.json();
-        const parts = j && j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts || [];
-        let text = parts.map(p => p.text || '').join('').replace(/^```[a-z]*\n?|```$/g, '').trim();
-        // โหมดรหัส: รวมจากบรรทัด CHARS: (ถอดทีละตัว) แทนบรรทัดรหัสเต็มที่โมเดลพิมพ์เอง
-        const lines = text.split(/\n/);
-        const out = [];
-        for (let i = 0; i < lines.length; i++) {
-            const m = lines[i].match(/^\s*CHARS:\s*(.+)$/i);
-            if (m) { const joined = m[1].trim().split(/\s+/).join(''); out.push(joined); if (i + 1 < lines.length && lines[i + 1].replace(/\s+/g, '').toUpperCase() === joined.toUpperCase()) i++; else if (i + 1 < lines.length && /^[A-Za-z0-9\-_.\/]+$/.test(lines[i + 1].trim())) i++; }
-            else out.push(lines[i]);
+        const cleanOne = (cand) => {
+            const parts = cand && cand.content && cand.content.parts || [];
+            let text = parts.map(p => p.text || '').join('').replace(/^```[a-z]*\n?|```$/g, '').trim();
+            // โหมดรหัส: รวมจากบรรทัด CHARS: (ถอดทีละตัว) แทนบรรทัดรหัสเต็มที่โมเดลพิมพ์เอง
+            const lines = text.split(/\n/); const out = [];
+            for (let i = 0; i < lines.length; i++) {
+                const m = lines[i].match(/^\s*CHARS:\s*(.+)$/i);
+                if (m) { const joined = m[1].trim().split(/\s+/).join(''); out.push(joined); if (i + 1 < lines.length && lines[i + 1].replace(/\s+/g, '').toUpperCase() === joined.toUpperCase()) i++; else if (i + 1 < lines.length && /^[A-Za-z0-9\-_.\/]+$/.test(lines[i + 1].trim())) i++; }
+                else out.push(lines[i]);
+            }
+            return out.join('\n').trim();
+        };
+        const cands = (j && j.candidates || []).map(cleanOne).filter(t => t.length);
+        // โหวต: คำตอบที่ซ้ำกันมากที่สุดชนะ (เทียบแบบตัดช่องว่าง) ถ้าเสมอกันเลือกอันที่สั้นกว่า (การเบิ้ลเลขทำให้ยาวขึ้น)
+        let text = '';
+        if (cands.length) {
+            const norm = t => t.replace(/\s+/g, '').toUpperCase();
+            const tally = new Map(); cands.forEach(t => { const k = norm(t); tally.set(k, (tally.get(k) || 0) + 1); });
+            const best = [...tally.entries()].sort((a, b) => b[1] - a[1] || a[0].length - b[0].length)[0][0];
+            text = cands.find(t => norm(t) === best) || cands[0];
+            if (cands.length > 1 && tally.size > 1) console.log('[kbiz-api] gemini vote:', [...tally.entries()].map(([k, n]) => n + '×' + k.slice(0, 30)).join(' | '));
         }
-        text = out.join('\n').trim();
         return {
             ParsedResults: [{ ParsedText: text, TextOverlay: { Lines: [], HasOverlay: false, Message: '' }, FileParseExitCode: 1, ErrorMessage: '', ErrorDetails: '' }],
             OCRExitCode: 1, IsErroredOnProcessing: false, ProcessingTimeInMilliseconds: '0', __engine: 'gemini', __empty: !text
