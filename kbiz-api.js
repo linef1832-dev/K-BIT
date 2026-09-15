@@ -269,20 +269,24 @@ module.exports = function attachKbizApi(app) {
         const prompt = `ถอดข้อความทั้งหมดที่เห็นในรูปนี้แบบตรงตัว (OCR) ${hint}
 กฎ: รักษาบรรทัดตามรูป, ไม่แปล, ไม่อธิบาย, ไม่ใส่เครื่องหมายคำพูดหรือ markdown, ภาษาไทยเขียนติดกันตามปกติ (เว้นวรรคเฉพาะที่รูปเว้น), ตัวเลขและเครื่องหมาย - ให้ตรงตามรูปทุกตัว
 ถ้าไม่มีข้อความให้ตอบว่างเปล่า`;
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
-        let r;
-        try {
-            r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`, {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    contents: [{ parts: [{ inlineData: { mimeType: mime, data: b64 } }, { text: prompt }] }],
-                    generationConfig: { temperature: 0, maxOutputTokens: 2048, thinkingConfig: { thinkingBudget: 0 } }
-                }),
-                signal: controller.signal
-            });
-        } finally { clearTimeout(timer); }
-        if (!r.ok) { const t = await r.text().catch(() => ''); throw new Error(`gemini ${r.status}${t ? ': ' + t.slice(0, 200) : ''}`); }
+        const call = async (body) => {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
+            try {
+                return await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL.trim()}:generateContent`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY.trim() },
+                    body: JSON.stringify(body), signal: controller.signal
+                });
+            } finally { clearTimeout(timer); }
+        };
+        const contents = [{ role: 'user', parts: [{ text: prompt }, { inline_data: { mime_type: mime, data: b64 } }] }];
+        let r = await call({ contents, generationConfig: { temperature: 0, maxOutputTokens: 2048 } });
+        if (r.status === 400) {
+            const t1 = await r.text().catch(() => '');
+            console.warn('[kbiz-api] gemini 400 (รอบแรก) mime=' + mime + ' b64len=' + b64.length + ' model=' + GEMINI_MODEL + ' → ' + t1.replace(/\s+/g, ' ').slice(0, 400));
+            r = await call({ contents }); // ลองแบบไม่มี generationConfig
+        }
+        if (!r.ok) { const t = await r.text().catch(() => ''); throw new Error(`gemini ${r.status}${t ? ': ' + t.replace(/\s+/g, ' ').slice(0, 400) : ''}`); }
         const j = await r.json();
         const parts = j && j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts || [];
         let text = parts.map(p => p.text || '').join('').replace(/^```[a-z]*\n?|```$/g, '').trim();
@@ -469,6 +473,15 @@ module.exports = function attachKbizApi(app) {
         const engine = await currentEngine();
         res.json({ ok: true, google: !!GOOGLE_VISION_API_KEY, gemini: !!GEMINI_API_KEY, engine, geminiModel: GEMINI_MODEL,
                    primary: engine === 'vision' ? 'google-vision' : engine === 'gemini' ? 'gemini' : 'ocr.space', dailyLimit: GV_DAILY_LIMIT, stats: ocrStats, budget: await loadBudget(true), rates: { vision: VISION_COST, gemini: GEMINI_COST } });
+    });
+
+    // ---------- GET /api/ocr/test-gemini : ทดสอบ Gemini ตรงๆ (เปิดในเบราว์เซอร์ได้) ----------
+    app.get('/api/ocr/test-gemini', cors, async (req, res) => {
+        const png = 'iVBORw0KGgoAAAANSUhEUgAAAGQAAAAeCAYAAADoFhFtAAAACXBIWXMAAA7EAAAOxAGVKw4bAAABKklEQVRoge2ZwQ6CMAyGf40nH8B38QG8ePMV9OqbeDZefBCPxpOJNvHgDAyGbaz9k+ZLSCAd/aBb1wIBAAAAAAAAAAAAsA0mp5ytdO3W7rr3EpJn5ZYo5Ry9RsTjkHJ2yPMO9xU6KcG0UT9KyeVh3xkYQ7mAJEmS9CQ7gSpk5YJqYyQ2RQ1v6l9GQOaY6nHqRq0Ew1rGkFq2c6rGkEbqWtSTU0zhZ0UBhK1qGh7nqxIGaIm2zNqqBtVURJ2q1FzY6qnCVA/kH6H6z6Ii5H3bHxDbNDzR1zcKGH5ObmNH4XuG2g6b7Gx4Q1IzJSyLxNtYwJ3QysHNy8YQ0EjJtBCw6kWJWYbQyE39pV6DRtlV5B+dPZLiFmp8b5H3B+mYcvw2c2xHAAAAAAAAAAAAADAJ3wAcHMbG84nF04AAAAASUVORK5CYII=';
+        try {
+            const data = await geminiOCR('data:image/png;base64,' + png, 'eng');
+            res.json({ ok: true, model: GEMINI_MODEL, text: data.ParsedResults[0].ParsedText, note: 'ถ้าเห็น ok:true แสดงว่า Gemini ใช้ได้แล้ว' });
+        } catch (e) { res.json({ ok: false, model: GEMINI_MODEL, keyPrefix: GEMINI_API_KEY.slice(0, 6), error: e.message }); }
     });
 
     // ---------- GET /api/ping : ปลุกเซิร์ฟเวอร์ ----------
