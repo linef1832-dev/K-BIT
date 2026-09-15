@@ -268,6 +268,7 @@ module.exports = function attachKbizApi(app) {
         const hint = (l === 'eng' || l === 'code' || l === 'en') ? 'ข้อความส่วนใหญ่เป็นตัวเลข/ภาษาอังกฤษ/รหัส' : 'ข้อความอาจเป็นภาษาไทยปนอังกฤษและตัวเลข';
         const prompt = `ถอดข้อความทั้งหมดที่เห็นในรูปนี้แบบตรงตัว (OCR) ${hint}
 กฎ: รักษาบรรทัดตามรูป, ไม่แปล, ไม่อธิบาย, ไม่ใส่เครื่องหมายคำพูดหรือ markdown, ภาษาไทยเขียนติดกันตามปกติ (เว้นวรรคเฉพาะที่รูปเว้น), ตัวเลข/รหัสให้อ่านทีละตัวอักษรตามที่เห็นจริง ห้ามเดา ห้ามเติมหรือตัดตัวเลข จำนวนตัวอักษรต้องเท่ากับในรูป
+ถ้าข้อความเป็นรหัส/หมายเลข (ตัวอักษรอังกฤษ+ตัวเลขยาวติดกัน): ให้ทำ 2 ขั้น — บรรทัดแรกเขียนว่า CHARS: แล้วตามด้วยตัวอักษรทีละตัวคั่นด้วยช่องว่าง (เช่น CHARS: T 8 8 N 8 8 3 O K 2 7 6 7) โดยไล่จากซ้ายไปขวาทีละตัว นับให้ครบไม่ข้ามไม่เบิ้ล แล้วบรรทัดถัดไปเขียนรหัสเต็มโดยรวมตัวอักษรจากบรรทัด CHARS ตรงๆ
 สำคัญ: ข้อความที่ถูกตัดขาดที่ขอบรูป (เห็นแค่ครึ่งบน/ครึ่งล่างของตัวอักษร หรือบรรทัดที่โผล่มาแค่เสี้ยวเดียวที่ขอบบนหรือขอบล่าง) ให้ข้ามไป ไม่ต้องใส่ เอาเฉพาะบรรทัดที่เห็นครบทั้งตัว
 ถ้าไม่มีข้อความให้ตอบว่างเปล่า`;
         const call = async (body) => {
@@ -281,7 +282,8 @@ module.exports = function attachKbizApi(app) {
             } finally { clearTimeout(timer); }
         };
         const contents = [{ role: 'user', parts: [{ text: prompt }, { inline_data: { mime_type: mime, data: b64 } }] }];
-        let r = await call({ contents, generationConfig: { temperature: 0, maxOutputTokens: 2048 } });
+        const gen = { temperature: 0, maxOutputTokens: 2048, mediaResolution: process.env.GEMINI_MEDIA_RES || 'MEDIA_RESOLUTION_HIGH' }; // ดูรูปละเอียดขึ้น ช่วยอ่านเลข/ตัวเล็ก
+        let r = await call({ contents, generationConfig: gen });
         if (r.status === 400) {
             const t1 = await r.text().catch(() => '');
             console.warn('[kbiz-api] gemini 400 (รอบแรก) mime=' + mime + ' b64len=' + b64.length + ' model=' + GEMINI_MODEL + ' → ' + t1.replace(/\s+/g, ' ').slice(0, 400));
@@ -291,6 +293,15 @@ module.exports = function attachKbizApi(app) {
         const j = await r.json();
         const parts = j && j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts || [];
         let text = parts.map(p => p.text || '').join('').replace(/^```[a-z]*\n?|```$/g, '').trim();
+        // โหมดรหัส: รวมจากบรรทัด CHARS: (ถอดทีละตัว) แทนบรรทัดรหัสเต็มที่โมเดลพิมพ์เอง
+        const lines = text.split(/\n/);
+        const out = [];
+        for (let i = 0; i < lines.length; i++) {
+            const m = lines[i].match(/^\s*CHARS:\s*(.+)$/i);
+            if (m) { const joined = m[1].trim().split(/\s+/).join(''); out.push(joined); if (i + 1 < lines.length && lines[i + 1].replace(/\s+/g, '').toUpperCase() === joined.toUpperCase()) i++; else if (i + 1 < lines.length && /^[A-Za-z0-9\-_.\/]+$/.test(lines[i + 1].trim())) i++; }
+            else out.push(lines[i]);
+        }
+        text = out.join('\n').trim();
         return {
             ParsedResults: [{ ParsedText: text, TextOverlay: { Lines: [], HasOverlay: false, Message: '' }, FileParseExitCode: 1, ErrorMessage: '', ErrorDetails: '' }],
             OCRExitCode: 1, IsErroredOnProcessing: false, ProcessingTimeInMilliseconds: '0', __engine: 'gemini', __empty: !text
