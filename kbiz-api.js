@@ -375,7 +375,7 @@ module.exports = function attachKbizApi(app) {
     } catch (e) {} })();
     // 💰 ยอดเงินคงเหลือ (ประมาณการ): แอดมินกรอกยอดตั้งต้น ระบบหักตามราคาต่อรูป — settings.ocr_budget
     const VISION_COST = parseFloat(process.env.VISION_COST_THB || '0.05');    // ~$1.50/1000
-    const GEMINI_COST = parseFloat(process.env.GEMINI_COST_THB || '0.007'); // flash-lite + ละเอียดสูง + โหวต 3 คำตอบ (ประมาณการ ปรับได้ด้วย GEMINI_COST_THB)
+    const GEMINI_COST = parseFloat(process.env.GEMINI_COST_THB || '0.01'); // flash-lite + ละเอียดสูง + โหวต 3 คำตอบ (ประมาณการ ปรับได้ด้วย GEMINI_COST_THB)
     let budget = { vision_start: 0, vision_used: 0, gemini_start: 0, gemini_used: 0, vision_calls: 0, gemini_calls: 0, updated: 0 };
     let budgetLoadedAt = 0, budgetSaveTimer = null;
     async function loadBudget(force) {
@@ -388,8 +388,8 @@ module.exports = function attachKbizApi(app) {
     }
     loadBudget(true);
     function spend(engine) {
-        if (engine === 'vision') { budget.vision_used = +(budget.vision_used + VISION_COST).toFixed(4); budget.vision_calls = (budget.vision_calls || 0) + 1; }
-        else if (engine === 'gemini') { budget.gemini_used = +(budget.gemini_used + GEMINI_COST).toFixed(4); budget.gemini_calls = (budget.gemini_calls || 0) + 1; }
+        if (engine === 'vision') { budget.vision_used = +(budget.vision_used + VISION_COST).toFixed(4); budget.vision_calls = (budget.vision_calls || 0) + 1; histBump('vision', VISION_COST); }
+        else if (engine === 'gemini') { budget.gemini_used = +(budget.gemini_used + GEMINI_COST).toFixed(4); budget.gemini_calls = (budget.gemini_calls || 0) + 1; histBump('gemini', GEMINI_COST); }
         budget.updated = Date.now();
         clearTimeout(budgetSaveTimer);
         budgetSaveTimer = setTimeout(async () => {
@@ -397,6 +397,24 @@ module.exports = function attachKbizApi(app) {
             try { const d = await sbGet('settings?key=eq.ocr_budget&select=value'); if (d && d[0] && d[0].value) { const b = JSON.parse(d[0].value); budget.vision_start = b.vision_start ?? budget.vision_start; budget.gemini_start = b.gemini_start ?? budget.gemini_start; if (b.reset_at && b.reset_at > (budget.reset_at || 0)) { budget.vision_used = 0; budget.gemini_used = 0; budget.vision_calls = 0; budget.gemini_calls = 0; budget.reset_at = b.reset_at; } } } catch (e) {}
             sbUpsertSetting('ocr_budget', budget).catch(() => {});
         }, 3000);
+    }
+    // 📅 ประวัติการใช้รายวัน (เก็บ 90 วัน) — settings.ocr_history = { 'YYYY-MM-DD': { vision, gemini, fallback, vision_thb, gemini_thb } }
+    let history = {}; let histLoadedAt = 0, histSaveTimer = null;
+    async function loadHistory(force) {
+        if (!force && Date.now() - histLoadedAt < 30000) return history;
+        try { const d = await sbGet('settings?key=eq.ocr_history&select=value'); if (d && d[0] && d[0].value) { const h = JSON.parse(d[0].value); if (h && typeof h === 'object' && !histSaveTimer) history = h; } } catch (e) {}
+        histLoadedAt = Date.now(); return history;
+    }
+    loadHistory(true);
+    function histBump(engine, thb) {
+        const day = thaiDayKey();
+        const h = history[day] || (history[day] = { vision: 0, gemini: 0, fallback: 0, vision_thb: 0, gemini_thb: 0 });
+        h[engine] = (h[engine] || 0) + 1;
+        if (engine === 'vision') h.vision_thb = +(h.vision_thb + thb).toFixed(4);
+        if (engine === 'gemini') h.gemini_thb = +(h.gemini_thb + thb).toFixed(4);
+        const keys = Object.keys(history).sort(); while (keys.length > 90) delete history[keys.shift()];
+        clearTimeout(histSaveTimer);
+        histSaveTimer = setTimeout(() => { histSaveTimer = null; sbUpsertSetting('ocr_history', history).catch(() => {}); }, 3000);
     }
     let statsSaveTimer = null;
     function bumpStats(field, extra) {
@@ -487,6 +505,7 @@ module.exports = function attachKbizApi(app) {
                 }
                 incrementUsage(k.id); // ไม่ต้อง await
                 bumpStats('fallback_ok', { last_engine: 'ocr.space' });
+                histBump('fallback', 0);
                 return res.json({ ok: true, data: d, keyName: k.key_name });
             } catch (e) {
                 lastErr = e.name === 'AbortError' ? 'OCR.space ตอบช้าเกินไป' : e.message;
@@ -523,7 +542,7 @@ module.exports = function attachKbizApi(app) {
         engineCache.at = 0; // หน้าแอดมินกดรีเฟรช → อ่านค่าล่าสุดทันที
         const engine = await currentEngine();
         res.json({ ok: true, google: !!GOOGLE_VISION_API_KEY, gemini: !!GEMINI_API_KEY, engine, geminiModel: GEMINI_MODEL,
-                   primary: engine === 'vision' ? 'google-vision' : engine === 'gemini' ? 'gemini' : 'ocr.space', dailyLimit: GV_DAILY_LIMIT, stats: ocrStats, budget: await loadBudget(true), rates: { vision: VISION_COST, gemini: GEMINI_COST } });
+                   primary: engine === 'vision' ? 'google-vision' : engine === 'gemini' ? 'gemini' : 'ocr.space', dailyLimit: GV_DAILY_LIMIT, stats: ocrStats, budget: await loadBudget(true), rates: { vision: VISION_COST, gemini: GEMINI_COST }, history: await loadHistory(true), today: thaiDayKey() });
     });
 
     // ---------- GET /api/ocr/test-gemini : ทดสอบ Gemini ตรงๆ (เปิดในเบราว์เซอร์ได้) ----------
