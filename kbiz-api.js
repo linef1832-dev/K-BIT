@@ -319,6 +319,31 @@ module.exports = function attachKbizApi(app) {
         const d = await sbGet('settings?key=eq.ocr_stats&select=value');
         if (d && d[0] && d[0].value) { const s = JSON.parse(d[0].value); if (s && s.day === thaiDayKey()) ocrStats = Object.assign(ocrStats, s); }
     } catch (e) {} })();
+    // 💰 ยอดเงินคงเหลือ (ประมาณการ): แอดมินกรอกยอดตั้งต้น ระบบหักตามราคาต่อรูป — settings.ocr_budget
+    const VISION_COST = parseFloat(process.env.VISION_COST_THB || '0.05');    // ~$1.50/1000
+    const GEMINI_COST = parseFloat(process.env.GEMINI_COST_THB || '0.0015'); // flash-lite รูปเล็ก ~260 โทเค็น
+    let budget = { vision_start: 0, vision_used: 0, gemini_start: 0, gemini_used: 0, vision_calls: 0, gemini_calls: 0, updated: 0 };
+    let budgetLoadedAt = 0, budgetSaveTimer = null;
+    async function loadBudget(force) {
+        if (!force && Date.now() - budgetLoadedAt < 20000) return budget;
+        try { const d = await sbGet('settings?key=eq.ocr_budget&select=value'); if (d && d[0] && d[0].value) { const b = JSON.parse(d[0].value); if (b && typeof b === 'object') {
+            if (budgetSaveTimer) { budget.vision_start = b.vision_start ?? budget.vision_start; budget.gemini_start = b.gemini_start ?? budget.gemini_start; } // มีการใช้ที่ยังไม่เซฟ → อย่าทับตัวนับ
+            else budget = Object.assign(budget, b);
+        } } } catch (e) {}
+        budgetLoadedAt = Date.now(); return budget;
+    }
+    loadBudget(true);
+    function spend(engine) {
+        if (engine === 'vision') { budget.vision_used = +(budget.vision_used + VISION_COST).toFixed(4); budget.vision_calls = (budget.vision_calls || 0) + 1; }
+        else if (engine === 'gemini') { budget.gemini_used = +(budget.gemini_used + GEMINI_COST).toFixed(4); budget.gemini_calls = (budget.gemini_calls || 0) + 1; }
+        budget.updated = Date.now();
+        clearTimeout(budgetSaveTimer);
+        budgetSaveTimer = setTimeout(async () => {
+            // รวมกับค่าที่แอดมินอาจแก้ยอดตั้งต้นไว้ระหว่างนี้
+            try { const d = await sbGet('settings?key=eq.ocr_budget&select=value'); if (d && d[0] && d[0].value) { const b = JSON.parse(d[0].value); budget.vision_start = b.vision_start ?? budget.vision_start; budget.gemini_start = b.gemini_start ?? budget.gemini_start; if (b.reset_at && b.reset_at > (budget.reset_at || 0)) { budget.vision_used = 0; budget.gemini_used = 0; budget.vision_calls = 0; budget.gemini_calls = 0; budget.reset_at = b.reset_at; } } } catch (e) {}
+            sbUpsertSetting('ocr_budget', budget).catch(() => {});
+        }, 3000);
+    }
     let statsSaveTimer = null;
     function bumpStats(field, extra) {
         if (ocrStats.day !== thaiDayKey()) ocrStats = { day: thaiDayKey(), google_ok: 0, google_fail: 0, gemini_ok: 0, gemini_fail: 0, fallback_ok: 0, fallback_fail: 0, last_engine: null, last_error: null, last_ms: null, last_at: null };
@@ -364,6 +389,7 @@ module.exports = function attachKbizApi(app) {
             try {
                 const data = eng === 'vision' ? await googleVisionOCR(base64Image, language) : await geminiOCR(base64Image, language);
                 bumpStats(eng === 'vision' ? 'google_ok' : 'gemini_ok', { last_engine: eng === 'vision' ? 'google' : 'gemini', last_ms: Date.now() - t0, last_error: null });
+                spend(eng);
                 return res.json({ ok: true, data, keyName: eng === 'vision' ? 'google-vision' : 'gemini' });
             } catch (e) {
                 bumpStats(eng === 'vision' ? 'google_fail' : 'gemini_fail', { last_error: e.message });
@@ -442,7 +468,7 @@ module.exports = function attachKbizApi(app) {
         engineCache.at = 0; // หน้าแอดมินกดรีเฟรช → อ่านค่าล่าสุดทันที
         const engine = await currentEngine();
         res.json({ ok: true, google: !!GOOGLE_VISION_API_KEY, gemini: !!GEMINI_API_KEY, engine, geminiModel: GEMINI_MODEL,
-                   primary: engine === 'vision' ? 'google-vision' : engine === 'gemini' ? 'gemini' : 'ocr.space', dailyLimit: GV_DAILY_LIMIT, stats: ocrStats });
+                   primary: engine === 'vision' ? 'google-vision' : engine === 'gemini' ? 'gemini' : 'ocr.space', dailyLimit: GV_DAILY_LIMIT, stats: ocrStats, budget: await loadBudget(true), rates: { vision: VISION_COST, gemini: GEMINI_COST } });
     });
 
     // ---------- GET /api/ping : ปลุกเซิร์ฟเวอร์ ----------
