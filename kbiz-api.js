@@ -275,7 +275,7 @@ module.exports = function attachKbizApi(app) {
 ถ้าข้อความเป็นรหัส/หมายเลข (ตัวอักษรอังกฤษ+ตัวเลขยาวติดกัน): ให้ทำ 2 ขั้น — บรรทัดแรกเขียนว่า CHARS: แล้วตามด้วยตัวอักษรทีละตัวคั่นด้วยช่องว่าง (เช่น CHARS: T 8 8 N 8 8 3 O K 2 7 6 7) โดยไล่จากซ้ายไปขวาทีละตัว นับให้ครบไม่ข้ามไม่เบิ้ล แล้วบรรทัดถัดไปเขียนรหัสเต็มโดยรวมตัวอักษรจากบรรทัด CHARS ตรงๆ
 สำคัญ: ข้อความที่ถูกตัดขาดที่ขอบรูป (เห็นแค่ครึ่งบน/ครึ่งล่างของตัวอักษร หรือบรรทัดที่โผล่มาแค่เสี้ยวเดียวที่ขอบบนหรือขอบล่าง) ให้ข้ามไป ไม่ต้องใส่ เอาเฉพาะบรรทัดที่เห็นครบทั้งตัว
 ถ้าไม่มีข้อความให้ตอบว่างเปล่า` +
-            (CODE_RULES.length ? `\nกฎรูปแบบรหัสที่ต้องยึด: ` + CODE_RULES.map(r => `รหัสที่ขึ้นต้นด้วย ${r.pfx} มีความยาวรวม ${r.len} ตัวอักษรเสมอ (ตัวเลขหลัง ${r.pfx} = ${r.len - r.pfx.length} หลัก) ถ้านับได้ไม่เท่านี้แสดงว่าอ่านผิด ให้ดูรูปใหม่อีกครั้งจนได้ครบพอดี`).join('; ') : '') +
+            (CODE_RULES.length ? `\nกฎรูปแบบรหัสที่ต้องยึด: ` + CODE_RULES.map(r => `รหัสที่ขึ้นต้นด้วย ${r.pfx} มีความยาวรวม ${r.len} ตัวอักษรเสมอ (ตัวเลขหลัง ${r.pfx} = ${r.len - r.pfx.length} หลัก) ใช้เป็นข้อมูลประกอบเท่านั้น ห้ามตัดหรือเติมตัวเลขเพื่อให้ครบ ให้เขียนตามที่เห็นจริงในรูป`).join('; ') : '') +
             (extraNote ? `\n${extraNote}` : '');
         const call = async (body) => {
             const controller = new AbortController();
@@ -288,39 +288,51 @@ module.exports = function attachKbizApi(app) {
             } finally { clearTimeout(timer); }
         };
         const contents = [{ role: 'user', parts: [{ text: prompt }, { inline_data: { mime_type: mime, data: b64 } }] }];
-        // ตอบ 3 คำตอบในคำขอเดียว (ส่งรูปครั้งเดียว) แล้วโหวต — ลด "เบิ้ลเลข" ที่เกิดแบบสุ่ม
+        // 🗳️ ยิง N คำขอ "พร้อมกัน" (ขนาน เวลาเท่าเดิม) แต่ละคำขอสั่งอ่านคนละวิธี แล้วโหวต — กันอาการเดา/เบิ้ลเลขที่เกิดจากรูปแบบ
         const NCAND = Math.max(1, Math.min(4, parseInt(process.env.GEMINI_CANDIDATES || '3', 10)));
-        const gen = { temperature: NCAND > 1 ? 0.5 : 0, candidateCount: NCAND, maxOutputTokens: 2048, mediaResolution: process.env.GEMINI_MEDIA_RES || 'MEDIA_RESOLUTION_HIGH' };
-        let r = await call({ contents, generationConfig: gen });
-        if (r.status === 400) {
-            const t1 = await r.text().catch(() => '');
-            console.warn('[kbiz-api] gemini 400 (รอบแรก) mime=' + mime + ' b64len=' + b64.length + ' model=' + GEMINI_MODEL + ' → ' + t1.replace(/\s+/g, ' ').slice(0, 400));
-            r = await call({ contents }); // ลองแบบไม่มี generationConfig
-        }
-        if (!r.ok) { const t = await r.text().catch(() => ''); throw new Error(`gemini ${r.status}${t ? ': ' + t.replace(/\s+/g, ' ').slice(0, 400) : ''}`); }
-        const j = await r.json();
-        const cleanOne = (cand) => {
+        const mediaRes = process.env.GEMINI_MEDIA_RES || 'MEDIA_RESOLUTION_HIGH';
+        const variants = [
+            '',
+            'วิธีอ่านรอบนี้: ถ้าเป็นรหัส ให้ไล่จาก "ขวาไปซ้าย" ทีละตัวก่อน (เขียนบรรทัด RTL: ตัวสุดท้าย ตัวรองสุดท้าย ... คั่นช่องว่าง) แล้วค่อยกลับลำดับเป็นรหัสปกติในบรรทัด CHARS:',
+            'วิธีอ่านรอบนี้: ถ้าเป็นรหัส ให้แบ่งเป็นกลุ่มละ 4 ตัวจากซ้าย (เช่น T88N 883O K276 ...) เขียนบรรทัด GROUPS: ก่อน แล้วค่อยเขียนบรรทัด CHARS: ทีละตัว',
+            'วิธีอ่านรอบนี้: อ่านรหัสทีละตัวช้าๆ และทุกครั้งที่เจอตัวเลขซ้ำติดกัน ให้นับจำนวนตัวซ้ำจากรูปจริงๆ (เช่น 66 = สองตัว, 888 = สามตัว) อย่าอนุมานจากตัวซ้ำก่อนหน้า'
+        ];
+        const mkBody = (note, withRes) => ({
+            contents: [{ role: 'user', parts: [{ text: prompt + (note ? '\n' + note : '') }, { inline_data: { mime_type: mime, data: b64 } }] }],
+            generationConfig: Object.assign({ temperature: 0, maxOutputTokens: 2048 }, withRes ? { mediaResolution: mediaRes } : {})
+        });
+        const oneCall = async (note) => {
+            let r = await call(mkBody(note, true));
+            if (r.status === 400) { const t1 = await r.text().catch(() => ''); console.warn('[kbiz-api] gemini 400 → ลองไม่ใส่ mediaResolution: ' + t1.replace(/\s+/g, ' ').slice(0, 200)); r = await call(mkBody(note, false)); }
+            if (!r.ok) { const t = await r.text().catch(() => ''); throw new Error(`gemini ${r.status}${t ? ': ' + t.replace(/\s+/g, ' ').slice(0, 300) : ''}`); }
+            return r.json();
+        };
+        const results = await Promise.allSettled(variants.slice(0, NCAND).map(oneCall));
+        const okRes = results.filter(x => x.status === 'fulfilled').map(x => x.value);
+        if (!okRes.length) throw results[0].reason || new Error('gemini failed');
+
+        const cleanOne = (j) => {
+            const cand = j && j.candidates && j.candidates[0];
             const parts = cand && cand.content && cand.content.parts || [];
             let text = parts.map(p => p.text || '').join('').replace(/^```[a-z]*\n?|```$/g, '').trim();
-            // โหมดรหัส: รวมจากบรรทัด CHARS: (ถอดทีละตัว) แทนบรรทัดรหัสเต็มที่โมเดลพิมพ์เอง
             const lines = text.split(/\n/); const out = [];
             for (let i = 0; i < lines.length; i++) {
+                if (/^\s*(RTL|GROUPS):/i.test(lines[i])) continue;                      // บรรทัดช่วยคิด ไม่เอา
                 const m = lines[i].match(/^\s*CHARS:\s*(.+)$/i);
-                if (m) { const joined = m[1].trim().split(/\s+/).join(''); out.push(joined); if (i + 1 < lines.length && lines[i + 1].replace(/\s+/g, '').toUpperCase() === joined.toUpperCase()) i++; else if (i + 1 < lines.length && /^[A-Za-z0-9\-_.\/]+$/.test(lines[i + 1].trim())) i++; }
+                if (m) { const joined = m[1].trim().split(/\s+/).join(''); out.push(joined); if (i + 1 < lines.length && /^[A-Za-z0-9\-_.\/]+$/.test(lines[i + 1].trim())) i++; }
                 else out.push(lines[i]);
             }
             return out.join('\n').trim();
         };
-        const cands = (j && j.candidates || []).map(cleanOne).filter(t => t.length);
-        // โหวต: คำตอบที่ซ้ำกันมากที่สุดชนะ (เทียบแบบตัดช่องว่าง) ถ้าเสมอกันเลือกอันที่สั้นกว่า (การเบิ้ลเลขทำให้ยาวขึ้น)
+        const cands = okRes.map(cleanOne).filter(t => t.length);
         let text = '';
         if (cands.length) {
             const norm = t => t.replace(/\s+/g, '').toUpperCase();
             const tally = new Map(); cands.forEach(t => { const k = norm(t); tally.set(k, (tally.get(k) || 0) + 1); });
-            // คำตอบที่ผ่านกฎความยาวรหัสมาก่อน → แล้วค่อยนับเสียง → แล้วค่อยสั้นกว่า
-            const best = [...tally.entries()].sort((a, b) => (ruleOk(b[0]) - ruleOk(a[0])) || (b[1] - a[1]) || (a[0].length - b[0].length))[0][0];
+            // เสียงข้างมากก่อน → ถ้าเสมอ เอาอันที่ผ่านกฎความยาว → ถ้ายังเสมอ เอาอันสั้นกว่า (เบิ้ลเลขทำให้ยาวขึ้น)
+            const best = [...tally.entries()].sort((a, b) => (b[1] - a[1]) || (ruleOk(b[0]) - ruleOk(a[0])) || (a[0].length - b[0].length))[0][0];
             text = cands.find(t => norm(t) === best) || cands[0];
-            if (cands.length > 1 && tally.size > 1) console.log('[kbiz-api] gemini vote:', [...tally.entries()].map(([k, n]) => n + '×' + k.slice(0, 30)).join(' | '));
+            if (tally.size > 1) console.log('[kbiz-api] gemini vote:', [...tally.entries()].map(([k, n]) => n + '×' + k.slice(0, 32)).join(' | '), '→', norm(text).slice(0, 32));
             var agree = tally.size === 1 && cands.length > 1;
         }
         return {
@@ -428,24 +440,6 @@ module.exports = function attachKbizApi(app) {
                 bumpStats(eng === 'vision' ? 'google_ok' : 'gemini_ok', { last_engine: eng === 'vision' ? 'google' : 'gemini', last_ms: Date.now() - t0, last_error: null });
                 spend(eng);
                 let keyName = eng === 'vision' ? 'google-vision' : 'gemini';
-                // 📏 ผลจาก Gemini ไม่ตรงกฎความยาวรหัส → ให้ Gemini อ่านใหม่อีกรอบพร้อมบอกว่าผิดตรงไหน (ไม่ใช้ Vision)
-                if (eng === 'gemini') {
-                    const txt = (data.ParsedResults[0].ParsedText || '').trim();
-                    const bad = txt.split(/\n/).map(l => l.trim()).find(l => ruleFor(l) && !ruleOk(l));
-                    if (bad) {
-                        const r = ruleFor(bad); const got = bad.replace(/\s+/g, '').length;
-                        console.log(`[kbiz-api] gemini ความยาวไม่ตรง (${got}≠${r.len}) → อ่านใหม่:`, bad.slice(0, 40));
-                        try {
-                            const t1 = Date.now();
-                            const again = await geminiOCR(base64Image, language, `หมายเหตุ: รอบก่อนอ่านรหัสได้ "${bad}" ซึ่งยาว ${got} ตัว แต่รหัสที่ขึ้นต้น ${r.pfx} ต้องยาว ${r.len} ตัวพอดี แสดงว่ามีตัวเลข${got > r.len ? 'เกินมา ' + (got - r.len) + ' ตัว (มักเป็นเลขซ้ำที่ถูกเบิ้ล)' : 'หายไป ' + (r.len - got) + ' ตัว'} ให้ดูรูปใหม่อย่างระมัดระวังทีละตัว แล้วตอบรหัสที่ยาว ${r.len} ตัวพอดี`);
-                            const t2 = (again.ParsedResults[0].ParsedText || '').trim();
-                            const fixed = t2.split(/\n/).map(l => l.trim()).find(l => ruleFor(l));
-                            bumpStats('gemini_ok', { last_engine: 'gemini×2', last_ms: Date.now() - t1 }); spend('gemini');
-                            if (fixed && ruleOk(fixed)) { data = again; keyName = 'gemini×2'; console.log('[kbiz-api] อ่านใหม่แล้วได้:', fixed); }
-                            else console.warn('[kbiz-api] อ่านใหม่ยังไม่ตรงกฎ ใช้ผลรอบแรก');
-                        } catch (e) { console.warn('[kbiz-api] อ่านใหม่ล้ม:', e.message); }
-                    }
-                }
                 return res.json({ ok: true, data, keyName });
             } catch (e) {
                 bumpStats(eng === 'vision' ? 'google_fail' : 'gemini_fail', { last_error: e.message });
