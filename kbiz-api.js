@@ -350,7 +350,7 @@ module.exports = function attachKbizApi(app) {
     } catch (e) {} })();
     // 💰 ยอดเงินคงเหลือ (ประมาณการ): แอดมินกรอกยอดตั้งต้น ระบบหักตามราคาต่อรูป — settings.ocr_budget
     const VISION_COST = parseFloat(process.env.VISION_COST_THB || '0.05');    // ~$1.50/1000
-    const GEMINI_COST = parseFloat(process.env.GEMINI_COST_THB || '0.0015'); // flash-lite รูปเล็ก ~260 โทเค็น
+    const GEMINI_COST = parseFloat(process.env.GEMINI_COST_THB || '0.007'); // flash-lite + ละเอียดสูง + โหวต 3 คำตอบ (ประมาณการ ปรับได้ด้วย GEMINI_COST_THB)
     let budget = { vision_start: 0, vision_used: 0, gemini_start: 0, gemini_used: 0, vision_calls: 0, gemini_calls: 0, updated: 0 };
     let budgetLoadedAt = 0, budgetSaveTimer = null;
     async function loadBudget(force) {
