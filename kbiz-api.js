@@ -297,13 +297,18 @@ module.exports = function attachKbizApi(app) {
             'วิธีอ่านรอบนี้: ถ้าเป็นรหัส ให้แบ่งเป็นกลุ่มละ 4 ตัวจากซ้าย (เช่น T88N 883O K276 ...) เขียนบรรทัด GROUPS: ก่อน แล้วค่อยเขียนบรรทัด CHARS: ทีละตัว',
             'วิธีอ่านรอบนี้: อ่านรหัสทีละตัวช้าๆ และทุกครั้งที่เจอตัวเลขซ้ำติดกัน ให้นับจำนวนตัวซ้ำจากรูปจริงๆ (เช่น 66 = สองตัว, 888 = สามตัว) อย่าอนุมานจากตัวซ้ำก่อนหน้า'
         ];
-        const mkBody = (note, withRes) => ({
+        // ปิด "การคิด" ของ Gemini 3.x ให้ต่ำสุด — OCR ไม่ต้องคิด คิดแล้วช้าหลายเท่า (ตั้งได้ที่ GEMINI_THINKING_LEVEL: minimal|low|medium|high, 'off' = ไม่ส่ง)
+        const thinkLv = (process.env.GEMINI_THINKING_LEVEL || 'low').toLowerCase();
+        const mkBody = (note, withRes, withThink) => ({
             contents: [{ role: 'user', parts: [{ text: prompt + (note ? '\n' + note : '') }, { inline_data: { mime_type: mime, data: b64 } }] }],
-            generationConfig: Object.assign({ temperature: 0, maxOutputTokens: 2048 }, withRes ? { mediaResolution: mediaRes } : {})
+            generationConfig: Object.assign({ temperature: 0, maxOutputTokens: 2048 },
+                withRes ? { mediaResolution: mediaRes } : {},
+                (withThink && thinkLv !== 'off') ? { thinkingConfig: { thinkingLevel: thinkLv } } : {})
         });
         const oneCall = async (note) => {
-            let r = await call(mkBody(note, true));
-            if (r.status === 400) { const t1 = await r.text().catch(() => ''); console.warn('[kbiz-api] gemini 400 → ลองไม่ใส่ mediaResolution: ' + t1.replace(/\s+/g, ' ').slice(0, 200)); r = await call(mkBody(note, false)); }
+            let r = await call(mkBody(note, true, true));
+            if (r.status === 400) { const t1 = await r.text().catch(() => ''); console.warn('[kbiz-api] gemini 400 → ลองไม่ใส่ thinking: ' + t1.replace(/\s+/g, ' ').slice(0, 200)); r = await call(mkBody(note, true, false)); }
+            if (r.status === 400) { const t1 = await r.text().catch(() => ''); console.warn('[kbiz-api] gemini 400 → ลองไม่ใส่ mediaResolution: ' + t1.replace(/\s+/g, ' ').slice(0, 200)); r = await call(mkBody(note, false, false)); }
             if (!r.ok) { const t = await r.text().catch(() => ''); throw new Error(`gemini ${r.status}${t ? ': ' + t.replace(/\s+/g, ' ').slice(0, 300) : ''}`); }
             return r.json();
         };
