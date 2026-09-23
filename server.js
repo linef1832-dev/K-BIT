@@ -100,6 +100,12 @@ io.on('connection', (socket) => {
         // เครื่องหลุดอยู่ → ไม่ตอบออฟไลน์ รับเข้าคิวไว้ พอเครื่องกลับมาจะเช็คให้เอง (รอได้สูงสุด JOB_MAX_AGE_MS)
         if (!sid || !bot) console.log(`⏳ ${targetMachine} ออฟไลน์ชั่วคราว — เก็บงาน ${data.accNo} ไว้รอ`);
 
+        // กันเลขซ้ำ: ถ้าเลขบัญชี+เครื่องเดียวกันยังค้างในคิวอยู่ → ไม่รับซ้ำ (กัน ambiguous)
+        const _dupe = [...jobs.values()].find(j => j.system === targetMachine && j.accNo === data.accNo);
+        if (_dupe) {
+            socket.emit('check_result', { status: 'error', message: `⏳ เลข ${data.accNo} กำลังตรวจอยู่ กรุณารอสักครู่`, system: targetMachine, reqAcc: data.accNo, reqBank: data.bankName });
+            return;
+        }
         const workerId = "job_" + Date.now() + "_" + Math.floor(Math.random() * 1000);
         jobs.set(workerId, { socketId: socket.id, clientId: data.clientId || null, bankName: data.bankName, accNo: data.accNo, system: targetMachine, ts: Date.now(), inFlight: false });
         socket.emit('job_accepted', { workerId, bankName: data.bankName, accNo: data.accNo, system: targetMachine });
